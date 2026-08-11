@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANSLIM TERMINAL  v3.0
+CANSLIM TERMINAL  v4.0
 윌리엄 오닐(William J. O'Neil) 기법 통합 투자 참고 터미널
 
 구성
@@ -477,7 +477,8 @@ def load_kr_fund(ticker):
                            "debt", "opm", "npm", "per", "pbr", "psr", "peg", "mktcap",
                            "eps_ttm", "bps", "div", "shares", "sector", "inst", "insider",
                            "float", "fper"]}
-    F.update({"table": None, "q_series": None, "y_series": None, "log": [], "src": []})
+    F.update({"table": None, "q_series": None, "y_series": None, "q_tab": None,
+              "y_tab": None, "log": [], "src": []})
     raw = None
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker}"
@@ -511,6 +512,24 @@ def load_kr_fund(ticker):
                 return None
             return pd.Series({c.split()[-1]: _to_num(r[c]) for c in cols}).dropna()
 
+        def multi(names, cols):
+            d = {}
+            for nm in names:
+                s = series(nm, cols)
+                if s is not None and len(s):
+                    d[nm] = s
+            if not d:
+                return None
+            t = pd.DataFrame(d).T
+            t.columns = [str(c) for c in t.columns]
+            return t
+
+        MET = ["매출액", "영업이익", "당기순이익", "EPS", "ROE", "영업이익률", "부채비율"]
+        F["q_tab"] = multi(MET, qcol)
+        F["y_tab"] = multi(MET, ycol)
+        for t in (F["q_tab"], F["y_tab"]):
+            if t is not None and "당기순이익" in t.index:
+                t.rename(index={"당기순이익": "순이익"}, inplace=True)
         F["q_series"], F["y_series"] = series("EPS", qcol), series("EPS", ycol)
         qs, ys = F["q_series"], F["y_series"]
         if qs is not None and len(qs) >= 5:
@@ -549,13 +568,31 @@ def load_kr_fund(ticker):
     return F
 
 
+def _us_tab(stmt):
+    """yfinance 손익계산서 → 지표×기간 테이블(한글 지표명)"""
+    mp = {"Total Revenue": "매출액", "Operating Income": "영업이익",
+          "Net Income": "순이익", "Diluted EPS": "EPS"}
+    rows = {}
+    for eng, kor in mp.items():
+        hit = [r for r in stmt.index if str(r) == eng or eng in str(r)]
+        if hit:
+            s = stmt.loc[hit[0]].astype(float)
+            rows[kor] = {c.strftime("%Y-%m") if hasattr(c, "strftime") else str(c): v
+                         for c, v in s.items()}
+    if not rows:
+        return None
+    t = pd.DataFrame(rows).T
+    return t[sorted(t.columns)]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_us_fund(ticker):
     F = {k: None for k in ["q_eps", "q_eps_prev", "y_eps", "y_eps_prev2", "q_sales", "roe",
                            "debt", "opm", "npm", "per", "fper", "pbr", "psr", "peg", "mktcap",
                            "inst", "insider", "float", "shares", "sector", "industry",
                            "eps_ttm", "bps", "div", "next_earnings"]}
-    F.update({"table": None, "q_series": None, "y_series": None, "log": [], "src": []})
+    F.update({"table": None, "q_series": None, "y_series": None, "q_tab": None,
+              "y_tab": None, "log": [], "src": []})
     if not HAS_YF:
         return F
     tk = yf.Ticker(ticker)
@@ -614,6 +651,7 @@ def load_us_fund(ticker):
                     ("Total Revenue", "Operating Income", "Net Income", "Diluted EPS")]
             if keep:
                 F["table"] = q.loc[keep]
+                F["q_tab"] = _us_tab(q)
             F["src"].append("yfinance 분기 손익")
             F["log"].append(("US 분기실적", "성공", "quarterly_income_stmt"))
     except Exception as e:
@@ -628,6 +666,7 @@ def load_us_fund(ticker):
                 F["y_series"] = s
                 if len(s) >= 2:
                     F["y_eps"], F["y_eps_prev2"] = float(s.iloc[-1]), float(s.iloc[-2])
+            F["y_tab"] = _us_tab(a)
     except Exception:
         pass
     return F
@@ -1858,6 +1897,331 @@ def cross_section(binfo, price, market):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 엔진 ⑨ 변동성 · 신뢰구간 (80%)
+# ════════════════════════════════════════════════════════════════════════════
+Z80 = 1.2816   # 표준정규 80% 양측 신뢰구간
+
+
+def volatility_profile(df, conf=0.80):
+    """로그수익률 표준편차 기반 기간별 변동 범위 + 이력 분위수 대조"""
+    z = Z80 if abs(conf - 0.80) < 1e-6 else float(abs(np.percentile(np.random.RandomState(0).normal(size=200000), (1 - conf) / 2 * 100)))
+    lr = np.log(df["Close"]).diff().dropna()
+    if len(lr) < 120:
+        return None
+    win = lr.tail(252)
+    sd, mu = float(win.std()), float(win.mean())
+    rows = []
+    for lab, n in [("1일", 1), ("1주", 5), ("1개월", 21), ("3개월", 63),
+                   ("6개월", 126), ("1년", 252)]:
+        s, m = sd * math.sqrt(n), mu * n
+        lo = (math.exp(m - z * s) - 1) * 100
+        hi = (math.exp(m + z * s) - 1) * 100
+        elo = ehi = np.nan
+        h = (df["Close"].pct_change(n).dropna() * 100)
+        if len(h) > max(60, n * 2):
+            elo, ehi = float(h.quantile((1 - conf) / 2)), float(h.quantile(1 - (1 - conf) / 2))
+        rows.append({"기간": lab, "일수": n, "sigma": s * 100, "lo": lo, "hi": hi,
+                     "elo": elo, "ehi": ehi})
+    s_ = df["Close"]
+    fmin = s_[::-1].rolling(21, min_periods=2).min()[::-1]
+    fmax = s_[::-1].rolling(61, min_periods=2).max()[::-1]
+    hit_stop = float(((fmin / s_ - 1) <= -0.08).mean() * 100)
+    hit_tgt = float(((fmax / s_ - 1) >= 0.20).mean() * 100)
+    ann = sd * math.sqrt(252) * 100
+    sd60 = float(lr.tail(60).std() * math.sqrt(252) * 100)
+    return {"sd_daily": sd * 100, "ann": ann, "ann60": sd60, "mu": mu * 100,
+            "rows": rows, "skew": float(win.skew()), "kurt": float(win.kurtosis()),
+            "hit_stop": hit_stop, "hit_tgt": hit_tgt, "z": z, "conf": conf,
+            "regime": "확대" if sd60 > ann * 1.15 else ("축소" if sd60 < ann * 0.85 else "안정")}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 엔진 ⑩ 재무 이력 (최근 3분기 · 최근 3년)
+# ════════════════════════════════════════════════════════════════════════════
+def growth_table(tab, lag, last=3, metrics=("매출액", "영업이익", "순이익", "EPS")):
+    """tab: DataFrame(index=지표, columns=기간 오름차순) → 최근 N기 성장률"""
+    if tab is None or tab.empty:
+        return None, None
+    cols = list(tab.columns)
+    if len(cols) < lag + 1:
+        lag_use, kind = 1, "직전 대비"
+    else:
+        lag_use, kind = lag, "전년 동기 대비"
+    rows = []
+    for c_i in range(len(cols) - last, len(cols)):
+        if c_i < 0:
+            continue
+        per = cols[c_i]
+        rec = {"기간": per}
+        for m in metrics:
+            if m not in tab.index:
+                continue
+            cur = safe(tab.loc[m, per])
+            rec[m] = cur
+            prev = safe(tab.loc[m, cols[c_i - lag_use]]) if c_i - lag_use >= 0 else None
+            rec[m + "증감"] = growth_pct(cur, prev)
+        rows.append(rec)
+    return pd.DataFrame(rows), kind
+
+
+def _clean(vals):
+    out = []
+    for v in vals:
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if np.isnan(f) or np.isinf(f):
+            continue
+        out.append(f)
+    return out
+
+
+def fin_history(fnd):
+    """3분기 · 3년 재무 이력과 오닐 기준 판정"""
+    out = {"q": None, "y": None, "q_kind": "", "y_kind": "",
+           "q_pass": None, "y_pass": None, "accel": None, "notes": []}
+    q_tab, y_tab = fnd.get("q_tab"), fnd.get("y_tab")
+    q, qk = growth_table(q_tab, 4, 3)
+    y, yk = growth_table(y_tab, 1, 3)
+    out["q"], out["q_kind"] = q, qk
+    out["y"], out["y_kind"] = y, yk
+    if q is not None and "EPS증감" in q.columns:
+        g = _clean(q["EPS증감"].tolist())
+        if g:
+            out["q_pass"] = sum(1 for v in g if v >= 25)
+            out["q_n"] = len(g)
+            if len(g) >= 2:
+                out["accel"] = g[-1] > g[0]
+            out["q_list"] = g
+    if y is not None and "EPS증감" in y.columns:
+        g = _clean(y["EPS증감"].tolist())
+        if g:
+            out["y_pass"] = sum(1 for v in g if v > 0)
+            out["y_n"] = len(g)
+            out["y_list"] = g
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 엔진 ⑪ 공포탐욕지수
+# ════════════════════════════════════════════════════════════════════════════
+def _scale(v, lo, hi):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    return float(max(0, min(100, (v - lo) / (hi - lo) * 100)))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_cnn_fng():
+    try:
+        r = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+                         timeout=8, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"})
+        j = r.json()
+        fg = j.get("fear_and_greed", {})
+        return {"score": float(fg.get("score")), "rating": fg.get("rating"),
+                "prev_close": safe(fg.get("previous_close")),
+                "week": safe(fg.get("previous_1_week")), "month": safe(fg.get("previous_1_month"))}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fng_market_data(market):
+    out = {}
+    if not HAS_YF:
+        return out
+    try:
+        syms = ["^VIX", "TLT", "HYG", "LQD"] if market == "US" else ["^VIX"]
+        px = yf.download(syms, period="1y", progress=False, auto_adjust=True)["Close"]
+        if isinstance(px, pd.Series):
+            px = px.to_frame(syms[0])
+        out["px"] = naive(px.dropna(how="all"))
+    except Exception:
+        pass
+    return out
+
+
+def fear_greed(market, states, uni, fx=None):
+    """CNN 방식을 준용한 자체 산출 (0=극단적 공포 · 100=극단적 탐욕)"""
+    comps, aux = [], _fng_market_data(market)
+    px = aux.get("px")
+
+    lead = None
+    for nm, s in states.items():
+        if market == "US" and nm == "S&P 500":
+            lead = s["df"]
+        elif market == "KR" and nm == "코스피":
+            lead = s["df"]
+    if lead is None and states:
+        lead = list(states.values())[0]["df"]
+
+    if lead is not None and len(lead) > 130:
+        c = lead["Close"]
+        mom = float(c.iloc[-1] / c.rolling(125).mean().iloc[-1] - 1) * 100
+        comps.append(("주가 모멘텀", _scale(mom, -6, 6),
+                      f'지수가 125일 평균 대비 {pct(mom)}', "평균 위 = 탐욕"))
+
+    if px is not None and "^VIX" in px.columns:
+        v = px["^VIX"].dropna()
+        if len(v) > 60:
+            vp = float((v < v.iloc[-1]).mean() * 100)
+            comps.append(("변동성 (VIX)", 100 - vp,
+                          f'VIX {v.iloc[-1]:.1f} · 1년 백분위 {vp:.0f}%', "낮은 변동성 = 탐욕"))
+    elif lead is not None and len(lead) > 260:
+        rv = np.log(lead["Close"]).diff().rolling(20).std() * math.sqrt(252) * 100
+        cur, hist = float(rv.iloc[-1]), rv.tail(252).dropna()
+        vp = float((hist < cur).mean() * 100)
+        comps.append(("변동성 (실현)", 100 - vp,
+                      f'20일 실현변동성 {cur:.1f}% · 1년 백분위 {vp:.0f}%', "낮은 변동성 = 탐욕"))
+
+    br = breadth_pct(uni)
+    if br is not None:
+        comps.append(("시장 폭", _scale(br, 25, 75),
+                      f'3개월 상승 종목 비율 {br:.0f}%', "많이 오를수록 탐욕"))
+    if uni is not None and not uni.empty and "r12" in uni.columns:
+        st12 = float((uni["r12"] > 0).mean() * 100)
+        comps.append(("주가 강도", _scale(st12, 30, 80),
+                      f'1년 상승 종목 비율 {st12:.0f}%', "신고가권 종목이 많을수록 탐욕"))
+
+    if px is not None and lead is not None and "TLT" in px.columns:
+        try:
+            eq = float(lead["Close"].iloc[-1] / lead["Close"].iloc[-21] - 1) * 100
+            bd = float(px["TLT"].iloc[-1] / px["TLT"].iloc[-21] - 1) * 100
+            comps.append(("안전자산 선호", _scale(eq - bd, -6, 6),
+                          f'주식 {pct(eq)} vs 장기국채 {pct(bd)} (20일)', "주식 우위 = 탐욕"))
+        except Exception:
+            pass
+    elif fx is not None and lead is not None:
+        try:
+            eq = float(lead["Close"].iloc[-1] / lead["Close"].iloc[-21] - 1) * 100
+            fxr = float(fx["Close"].iloc[-1] / fx["Close"].iloc[-21] - 1) * 100
+            comps.append(("안전자산 선호", _scale(eq - fxr, -6, 6),
+                          f'코스피 {pct(eq)} vs 원달러 {pct(fxr)} (20일)', "원화 강세+주가 상승 = 탐욕"))
+        except Exception:
+            pass
+
+    if px is not None and "HYG" in px.columns and "LQD" in px.columns:
+        try:
+            h = float(px["HYG"].iloc[-1] / px["HYG"].iloc[-21] - 1) * 100
+            l = float(px["LQD"].iloc[-1] / px["LQD"].iloc[-21] - 1) * 100
+            comps.append(("정크본드 수요", _scale(h - l, -2.5, 2.5),
+                          f'하이일드 {pct(h)} vs 우량채 {pct(l)} (20일)', "위험채권 선호 = 탐욕"))
+        except Exception:
+            pass
+
+    vals = [c[1] for c in comps if c[1] is not None]
+    if not vals:
+        return None
+    score = int(round(float(np.mean(vals))))
+    if score <= 24: label, kind = "극단적 공포", "down"
+    elif score <= 44: label, kind = "공포", "warn"
+    elif score <= 55: label, kind = "중립", "idle"
+    elif score <= 75: label, kind = "탐욕", "warn"
+    else: label, kind = "극단적 탐욕", "down"
+    return {"score": score, "label": label, "kind": kind, "comps": comps,
+            "cnn": fetch_cnn_fng() if market == "US" else None}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 엔진 ⑫ 내 투자 관리
+# ════════════════════════════════════════════════════════════════════════════
+PORT_FILE = "portfolio.json"
+LAST_FILE = "last_ticker.json"
+
+
+def load_json_file(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
+def save_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+
+
+def load_portfolio():
+    if "port" not in st.session_state:
+        st.session_state["port"] = load_json_file(PORT_FILE, {"open": [], "closed": []})
+    p = st.session_state["port"]
+    p.setdefault("open", []); p.setdefault("closed", [])
+    return p
+
+
+def save_portfolio(p):
+    st.session_state["port"] = p
+    save_json_file(PORT_FILE, p)
+
+
+def position_review(h, zp=8.0):
+    """보유 종목 1건에 대한 오늘의 전략"""
+    tk = h["ticker"]
+    df, market, name, _ = load_price(tk)
+    if df is None or len(df) < 200:
+        return {"ok": False, "ticker": tk, "name": tk}
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    px = float(df["Close"].iloc[-1])
+    buy = float(h["price"])
+    qty = float(h.get("qty") or 0)
+    bdate = pd.to_datetime(h["date"])
+    ret = (px / buy - 1) * 100
+    held = int((df.index[-1] - bdate).days)
+    ma, ma_ok, _u = ma_stack(df)
+    binfo = analyze_base(df, market, zp)
+    top = topping_signals(df, binfo, ma)
+    sp = sell_pressure(df, ma, top, binfo)
+    stop = round_tick(buy * 0.92, market, up=False)
+    t1, t2 = round_tick(buy * 1.20, market, False), round_tick(buy * 1.25, market, False)
+    peak = float(df.loc[bdate:, "Close"].max()) if len(df.loc[bdate:]) else px
+    peak_ret = (peak / buy - 1) * 100
+    dd_from_peak = (px / peak - 1) * 100
+    eight = (peak_ret >= 20 and held <= 21)
+    below50 = (not np.isnan(ma[50])) and px < ma[50]
+    below200 = (not np.isnan(ma[200])) and px < ma[200]
+
+    if ret <= -7:
+        act, kind, why = "즉시 손절", "fail", f"매수가 대비 {pct(ret)} — 오닐 -7~8% 원칙 도달"
+    elif sp["score"] >= 65:
+        act, kind, why = "전량 매도 검토", "fail", "매도 압력 " + str(sp["score"]) + "점 · " + (sp["reasons"][0] if sp["reasons"] else "")
+    elif ret <= -4 and below50:
+        act, kind, why = "손절 준비", "warn", f"{pct(ret)} · 50일선 이탈 — 반등 실패 시 정리"
+    elif eight:
+        act, kind, why = "8주 보유 (익절 금지)", "pass", f"3주 내 최고 {pct(peak_ret)} 달성 — 오닐 8주 규칙 대상"
+    elif sp["score"] >= 45:
+        act, kind, why = "절반 익절", "warn", "매도 압력 " + str(sp["score"]) + "점"
+    elif ret >= 25:
+        act, kind, why = "2차 익절 구간", "warn", f"{pct(ret)} — 잔량 정리 또는 50일선 추적"
+    elif ret >= 20:
+        act, kind, why = "1차 익절 구간", "warn", f"{pct(ret)} — 절반 이상 실현 검토"
+    elif below200:
+        act, kind, why = "비중 축소", "fail", "200일선 아래 — 장기 추세 훼손"
+    elif ret > 0 and not below50:
+        act, kind, why = "보유 유지", "pass", f"{pct(ret)} · 50일선 위 유지"
+    else:
+        act, kind, why = "보유 · 관찰", "idle", f"{pct(ret)} · 손절선 {fmt(stop, market)} 유지"
+
+    r_mult = ret / 8.0
+    return {"ok": True, "ticker": tk, "name": name.split(" (")[0], "market": market,
+            "price": px, "buy": buy, "qty": qty, "ret": ret, "held": held,
+            "date": bdate, "stop": stop, "t1": t1, "t2": t2, "peak_ret": peak_ret,
+            "dd_from_peak": dd_from_peak, "sp": sp, "act": act, "kind": kind, "why": why,
+            "ma50": ma[50], "ma200": ma[200], "below50": below50, "below200": below200,
+            "binfo": binfo, "r_mult": r_mult, "value": px * qty, "cost": buy * qty,
+            "pl": (px - buy) * qty, "top": top}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 관심종목 저장 (누적)
 # ════════════════════════════════════════════════════════════════════════════
 def load_watchlist():
@@ -1891,9 +2255,10 @@ def save_watchlist(lst):
 with st.sidebar:
     st.markdown('<div class="masthead"><h1>CANSLIM</h1>'
                 '<div class="sub">O\'Neil Terminal v3</div></div>', unsafe_allow_html=True)
-    ticker_in = st.text_input("종목코드 / 티커", value="NVDA",
+    _last = load_json_file(LAST_FILE, {}).get("ticker", "NVDA")
+    ticker_in = st.text_input("종목코드 / 티커", value=_last,
                               help="한국 6자리 숫자(005930) · 해외 티커(NVDA)")
-    st.caption("입력 한 번으로 모든 탭이 갱신됩니다")
+    st.caption(f"마지막 조회 종목이 자동 저장됩니다 (현재 기본값 {_last})")
     st.markdown("---")
     capital = st.number_input("투자 가능 금액", min_value=0, value=0, step=1000000,
                               help="0이면 수량 계산을 생략합니다")
@@ -1910,8 +2275,8 @@ with st.sidebar:
                 f'{datetime.now():%Y-%m-%d %H:%M} 기준</div>', unsafe_allow_html=True)
 
 TK = ticker_in.strip().upper()
-TABS = st.tabs(["  대시보드  ", "  시장  ", "  개별종목  ", "  환율  ", "  뉴스  ",
-                "  누적 스캔  ", "  정밀 보강  ", "  사용 가이드  "])
+TABS = st.tabs(["  대시보드  ", "  시장  ", "  환율  ", "  개별종목  ", "  분석보강  ",
+                "  뉴스  ", "  종목스캔  ", "  my투자  ", "  사용 가이드  "])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1948,6 +2313,12 @@ def build_context(tk):
 
 
 CTX = build_context(TK)
+
+if CTX.get("ok") and TK:
+    save_json_file(LAST_FILE, {"ticker": TK, "at": datetime.now().isoformat(timespec="seconds")})
+    _wl = load_watchlist()
+    if TK not in _wl:
+        save_watchlist(_wl + [TK])
 
 
 def derive(ctx, q_over=None, y_over=None):
@@ -2187,6 +2558,47 @@ with TABS[1]:
             f'오늘 적합도는 <b>{bw["score"]}점 · {bw["grade"]}</b>입니다.',
             "오닐의 시장 읽기", "oneil")
 
+        step_header("FEAR & GREED", "공포탐욕지수", "군중이 어디에 서 있는가")
+        fg = fear_greed(CTX["market"], states, CTX["uni"],
+                        load_fx()[0] if CTX["market"] == "KR" else None)
+        if fg is None:
+            st.markdown('<div class="hint">공포탐욕지수 산출에 필요한 데이터를 '
+                        '가져오지 못했습니다.</div>', unsafe_allow_html=True)
+        else:
+            fc = st.columns([1, 2])
+            gauge = ("극단적 공포 ◀ 공포 ◀ 중립 ▶ 탐욕 ▶ 극단적 탐욕")
+            gcol = P_DOWN if fg["kind"] == "down" else (P_ACC if fg["kind"] == "warn" else P_UP)
+            fc[0].markdown(bigcard("공포탐욕지수 (자체 산출)",
+                                   f'{fg["score"]}<span style="font-size:1rem">/100</span>',
+                                   f'<b>{fg["label"]}</b>' + bar(fg["score"], color=gcol)
+                                   + f'<div style="font-size:.68rem;margin-top:.3rem">{gauge}</div>',
+                                   "down" if fg["kind"] == "down" else
+                                   ("amb" if fg["kind"] == "warn" else "up")),
+                           unsafe_allow_html=True)
+            rows = [[a, f'<span class="mono">{v:.0f}</span>' if v is not None else "—", ev_, note]
+                    for a, v, ev_, note in fg["comps"]]
+            fc[1].markdown(table(["구성 항목", "점수", "측정값", "해석"], rows),
+                           unsafe_allow_html=True)
+            if fg.get("cnn"):
+                cn = fg["cnn"]
+                st.markdown(f'<div class="ev">참고 · CNN 공식 Fear &amp; Greed Index '
+                            f'<b>{cn["score"]:.0f} ({cn["rating"]})</b> · 1주 전 '
+                            f'{num(cn.get("week"),0)} · 1개월 전 {num(cn.get("month"),0)}</div>',
+                            unsafe_allow_html=True)
+            read_box(
+                '공포탐욕지수는 <b>군중의 감정</b>을 숫자로 바꾼 것입니다. 0에 가까울수록 다들 무서워하고, '
+                '100에 가까울수록 다들 낙관합니다.<br><br>'
+                '오닐은 이 지수를 쓰지 않았지만 같은 이야기를 했습니다. '
+                '<b>"모두가 사고 싶어 안달일 때가 팔 때"</b>라고요. 다만 주의할 점이 있습니다. '
+                '공포지수가 낮다고 바로 사는 것은 오닐 방식이 아닙니다. 공포 구간에서는 '
+                '<b>FTD가 뜰 때까지 기다렸다가</b> 사야 하고, 탐욕 구간에서는 <b>신규 매수 규모를 줄이고 '
+                '보유 종목의 고점 신호</b>를 챙겨야 합니다.<br><br>'
+                f'현재 <b>{fg["score"]}점 · {fg["label"]}</b>입니다. '
+                + ("극단 구간이므로 평소보다 신중하게 접근하세요."
+                   if fg["score"] <= 24 or fg["score"] >= 76
+                   else "극단 구간은 아니므로 시장 국면(FTD·분산일) 판단을 우선하세요."),
+                "공포탐욕지수 읽는 법", "oneil")
+
         for nm, s in states.items():
             with st.expander(f'{nm} 상세 차트 — 분산일 {s["dd_n"]}개'):
                 st.plotly_chart(index_chart(s, nm), use_container_width=True)
@@ -2200,9 +2612,9 @@ with TABS[1]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 2 — 개별종목
+# TAB 3 — 개별종목
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[2]:
+with TABS[3]:
     if not CTX.get("ok"):
         st.error("종목 데이터를 불러오지 못했습니다.")
     else:
@@ -2344,8 +2756,10 @@ with TABS[2]:
                                      "돌파후 최대(%)": None if fwd is None else round(fwd, 1)})
                     st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True)
 
-        # STEP 3 실적
-        step_header("STEP 3", "C · A — 실적 성장")
+        # STEP 3 실적 — 최근 3분기 · 최근 3년
+        step_header("STEP 3", "C · A — 실적 성장 (최근 3분기 · 최근 3년)",
+                    "오닐: 3분기 연속 +25% · 3년 연속 이익 증가")
+        FH = fin_history(fnd)
         with st.expander("실적이 비어 있으면 직접 입력 (DART · 10-Q 기준)"):
             mc = st.columns(4)
             m_q = mc[0].number_input("최근 분기 EPS", value=0.0, format="%.2f")
@@ -2355,42 +2769,119 @@ with TABS[2]:
         q_g = growth_pct(m_q, m_qp) if (m_q and m_qp) else D["q_g"]
         y_g = growth_pct(m_y, m_yp) if (m_y and m_yp) else D["y_g"]
         c_ok, a_ok = (q_g is not None and q_g >= 25), (y_g is not None and y_g >= 25)
+
+        qp, qn = FH.get("q_pass"), FH.get("q_n", 0)
+        yp, yn = FH.get("y_pass"), FH.get("y_n", 0)
         c = st.columns(4)
-        c[0].markdown(card("C · 분기 EPS", "흑자전환" if q_g == 999 else pct(q_g), "기준 +25%",
-                           "up" if c_ok else "down"), unsafe_allow_html=True)
-        c[1].markdown(card("A · 연간 EPS", "흑자전환" if y_g == 999 else pct(y_g), "기준 +25%",
-                           "up" if a_ok else "down"), unsafe_allow_html=True)
+        c[0].markdown(card("C · 최근 분기 EPS", "흑자전환" if q_g == 999 else pct(q_g),
+                           (f'3분기 중 <b>{qp}/{qn}분기</b>가 +25% 충족' if qp is not None
+                            else "분기 이력 수집 실패"), "up" if c_ok else "down"),
+                      unsafe_allow_html=True)
+        c[1].markdown(card("A · 최근 연간 EPS", "흑자전환" if y_g == 999 else pct(y_g),
+                           (f'3년 중 <b>{yp}/{yn}년</b>이 증가' if yp is not None
+                            else "연간 이력 수집 실패"), "up" if a_ok else "down"),
+                      unsafe_allow_html=True)
         c[2].markdown(card("분기 매출", pct(D["q_sales"]), "기준 +25%",
                            "up" if (D["q_sales"] or 0) >= 25 else "mut"), unsafe_allow_html=True)
         c[3].markdown(card("ROE / 영업이익률", f'{pct(D["roe"],0,False)} / {pct(D["opm"],0,False)}',
                            "ROE 17% 이상", "up" if (D["roe"] or 0) >= 17 else "mut"),
                       unsafe_allow_html=True)
-        qs = fnd.get("q_series")
-        if qs is not None and len(qs) >= 6:
-            try:
-                g = [growth_pct(float(qs.iloc[i]), float(qs.iloc[i - 4]))
-                     for i in range(len(qs) - 3, len(qs))]
-                g = [x for x in g if x is not None and x != 999]
-                if len(g) >= 2:
-                    acc = g[-1] > g[0]
-                    st.markdown(f'<div class="hint">분기별 EPS 증가율 추이: '
-                                f'{" → ".join(pct(x,0) for x in g)} '
-                                f'{tag("가속", "pass") if acc else tag("둔화", "warn")}</div>',
+
+        def _fin_rows(tab, market_):
+            if tab is None or tab.empty:
+                return None
+            rows = []
+            for _, r in tab.iterrows():
+                per = r["기간"]
+                cells = [f'<b>{per}</b>']
+                for m in ("매출액", "영업이익", "순이익", "EPS"):
+                    v, g = r.get(m), r.get(m + "증감")
+                    if g is not None and isinstance(g, float) and np.isnan(g):
+                        g = None
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        cells.append("—")
+                        continue
+                    if abs(v) >= 1e8:
+                        vs = f'{v/1e8:,.0f}억' if market_ == "KR" else f'{v/1e9:,.2f}B'
+                    elif abs(v) >= 1e4 and m != "EPS":
+                        vs = f'{v:,.0f}'
+                    else:
+                        vs = f'{v:,.2f}' if abs(v) < 100 else f'{v:,.0f}'
+                    if g is None:
+                        cells.append(f'<span class="mono">{vs}</span>')
+                    else:
+                        cl = "up" if g >= 25 else ("ink2" if g >= 0 else "down")
+                        gt = "흑자전환" if g == 999 else pct(g, 0)
+                        cells.append(f'<span class="mono">{vs}</span><br>'
+                                     f'<span class="mono {cl}" style="font-size:.72rem">{gt}</span>')
+                rows.append(cells)
+            return rows
+
+        cc = st.columns(2)
+        with cc[0]:
+            st.markdown(f'<div class="hint" style="margin:.3rem 0"><b>최근 3분기</b> · '
+                        f'증감은 {FH["q_kind"] or "—"}</div>', unsafe_allow_html=True)
+            qr = _fin_rows(FH["q"], market)
+            if qr:
+                st.markdown(table(["분기", "매출액", "영업이익", "순이익", "EPS"], qr),
+                            unsafe_allow_html=True)
+                if FH.get("q_list"):
+                    seq = " → ".join("흑자전환" if x == 999 else pct(x, 0) for x in FH["q_list"])
+                    acc = FH.get("accel")
+                    st.markdown(f'<div class="ev">분기 EPS 증가율 추이 <b>{seq}</b> '
+                                + (tag("가속", "pass") if acc else tag("둔화", "warn")) + '</div>',
                                 unsafe_allow_html=True)
-            except Exception:
-                pass
+            else:
+                st.markdown('<div class="hint">분기 실적을 불러오지 못했습니다. '
+                            '위 입력란에 공시 수치를 넣으면 판정에 반영됩니다.</div>',
+                            unsafe_allow_html=True)
+        with cc[1]:
+            st.markdown('<div class="hint" style="margin:.3rem 0"><b>최근 3년</b> · '
+                        '증감은 전년 대비 (가장 오래된 연도는 비교 대상이 없으면 공란)</div>',
+                        unsafe_allow_html=True)
+            yr = _fin_rows(FH["y"], market)
+            if yr:
+                st.markdown(table(["연도", "매출액", "영업이익", "순이익", "EPS"], yr),
+                            unsafe_allow_html=True)
+                if FH.get("y_list"):
+                    seq = " → ".join("흑자전환" if x == 999 else pct(x, 0) for x in FH["y_list"])
+                    st.markdown(f'<div class="ev">연간 EPS 증가율 추이 <b>{seq}</b></div>',
+                                unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="hint">연간 실적을 불러오지 못했습니다.</div>',
+                            unsafe_allow_html=True)
+
+        if FH.get("q_tab_extra") is None and fnd.get("y_tab") is not None:
+            yt = fnd["y_tab"]
+            extra = [m for m in ("ROE", "영업이익률", "부채비율") if m in yt.index]
+            if extra:
+                cols3 = list(yt.columns)[-3:]
+                rows = [[m] + [f'<span class="mono">{num(safe(yt.loc[m, c]),1)}</span>'
+                               for c in cols3] for m in extra]
+                st.markdown("<br>" + table(["지표"] + cols3, rows), unsafe_allow_html=True)
+
         st.markdown(evidence([
-            ("분기 EPS 증가율", "흑자전환" if q_g == 999 else pct(q_g), "+25% 이상", c_ok),
+            ("최근 분기 EPS 증가율", "흑자전환" if q_g == 999 else pct(q_g), "+25% 이상", c_ok),
+            ("3분기 중 25% 충족", f'{qp}/{qn}분기' if qp is not None else "—",
+             "3분기 모두", bool(qp is not None and qn and qp == qn)),
             ("연간 EPS 증가율", "흑자전환" if y_g == 999 else pct(y_g), "+25% 이상", a_ok),
+            ("3년 연속 이익 증가", f'{yp}/{yn}년' if yp is not None else "—",
+             "3년 모두", bool(yp is not None and yn and yp == yn)),
             ("분기 매출 증가율", pct(D["q_sales"]), "+25% 이상", (D["q_sales"] or 0) >= 25),
             ("ROE", pct(D["roe"], 1, False), "17% 이상", (D["roe"] or 0) >= 17)]),
             unsafe_allow_html=True)
         if fnd.get("table") is not None:
             with st.expander("원본 실적표"):
                 st.dataframe(fnd["table"], use_container_width=True)
-        read_box('C는 가장 최근 분기 이익이 1년 전 같은 분기보다 25% 이상 늘었는지, A는 연간 기준으로 같은 '
-                 '것을 봅니다. 오닐 연구에서 대박 종목은 급등 직전 분기 이익이 평균 70% 이상 늘어 있었습니다. '
-                 '매출도 함께 늘어야 진짜입니다. 그리고 증가율이 <b>가속</b>되는지가 절대 수준보다 중요합니다.')
+        read_box(
+            f'오닐은 한 분기만 좋은 회사를 믿지 않았습니다. <b>최근 3분기가 연속으로 25% 이상</b> 늘고, '
+            f'<b>최근 3년 연간 이익도 계속 늘어야</b> 합니다. 한 분기만 좋으면 일회성 이익일 수 있습니다.<br><br>'
+            f'그리고 절대 수준보다 <b>증가율이 빨라지는지</b>가 중요합니다. '
+            f'30% → 45% → 70%처럼 가속되는 회사가 대박 종목이 됩니다. 반대로 70% → 45% → 30%은 '
+            f'숫자는 좋아 보여도 이미 정점을 지난 신호입니다.<br><br>'
+            f'현재 분기는 {qp if qp is not None else "?"}/{qn if qn else "?"}분기가 기준을 넘었고, '
+            f'연간은 {yp if yp is not None else "?"}/{yn if yn else "?"}년이 증가했습니다.')
+
 
         # STEP 4 밸류에이션
         step_header("STEP 4", "재무 · 밸류에이션")
@@ -2602,9 +3093,9 @@ with TABS[2]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 3 — 환율
+# TAB 2 — 환율
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[3]:
+with TABS[2]:
     st.markdown('<div class="masthead"><h1>환율 분석 — USD/KRW</h1><div class="sub">'
                 '기간별 전략 · 평균 대비 위치 · 환전 시기 평가</div></div>', unsafe_allow_html=True)
     fx, dxy, fxlog = load_fx()
@@ -2690,9 +3181,9 @@ with TABS[3]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — 뉴스
+# TAB 5 — 뉴스
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[4]:
+with TABS[5]:
     st.markdown(f'<div class="masthead"><h1>{TK} 뉴스</h1><div class="sub">'
                 f'신뢰 기관 필터 · 주제 분류 · 투자 시사점</div></div>', unsafe_allow_html=True)
     if not CTX.get("ok"):
@@ -2742,10 +3233,10 @@ with TABS[4]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 5 — 누적 스캔
+# TAB 6 — 종목 스캔
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[5]:
-    st.markdown('<div class="masthead"><h1>누적 관심종목 스캔</h1><div class="sub">'
+with TABS[6]:
+    st.markdown('<div class="masthead"><h1>종목 스캔</h1><div class="sub">'
                 '추가한 종목이 목록에 계속 남습니다</div></div>', unsafe_allow_html=True)
     wl = load_watchlist()
     c = st.columns([2, 1, 1])
@@ -2818,15 +3309,16 @@ with TABS[5]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 6 — 정밀 보강 (기본 분석에서 빠지기 쉬운 항목)
+# TAB 4 — 분석보강 (기본 분석에서 빠지기 쉬운 항목)
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[6]:
-    st.markdown('<div class="masthead"><h1>정밀 보강 진단</h1><div class="sub">'
+with TABS[4]:
+    st.markdown('<div class="masthead"><h1>분석보강</h1><div class="sub">'
                 'CANSLIM 본체에는 없지만 실패를 줄이는 항목들</div></div>', unsafe_allow_html=True)
     if not CTX.get("ok"):
         st.info("종목을 먼저 입력하세요.")
     else:
         df, market, ma = CTX["df"], CTX["market"], CTX["ma"]
+        price = CTX["price"]
         diag = extra_diagnostics(df, market, CTX["binfo"], CTX["fnd"], CTX["lead"], capital, ma)
 
         step_header("RISK", "변동성 · 손절폭 적정성", "고정 -8%가 이 종목에 맞는가")
@@ -2844,6 +3336,67 @@ with TABS[6]:
                  f'{diag["atr"]:.1f}%인 종목에 8% 손절을 걸면 이틀치 정상 변동만으로도 손절될 수 있습니다. '
                  f'이 종목의 적정 손절폭은 <b>{diag["atr"]*2.5:.1f}%</b> 수준이므로, '
                  f'{"8% 손절이 다소 타이트합니다. 수량을 줄여 같은 금액 손실 한도를 맞추는 편이 낫습니다." if diag["atr"]*2.5 > 8 else "8% 손절이 충분히 여유 있습니다. 오닐 규칙 그대로 쓰면 됩니다."}')
+
+        step_header("CONFIDENCE", "80% 신뢰구간 주가 변동 범위",
+                    "이 종목이 통계적으로 움직일 수 있는 폭")
+        vp = volatility_profile(df, 0.80)
+        if vp is None:
+            st.markdown('<div class="hint">데이터가 부족해 변동성 분석을 할 수 없습니다.</div>',
+                        unsafe_allow_html=True)
+        else:
+            vc = st.columns(4)
+            vc[0].markdown(card("일간 표준편차", f'{vp["sd_daily"]:.2f}%',
+                                "하루 수익률의 흔들림 폭"), unsafe_allow_html=True)
+            vc[1].markdown(card("연환산 변동성", f'{vp["ann"]:.1f}%',
+                                f'최근 60일 기준 {vp["ann60"]:.1f}% · 국면 {vp["regime"]}',
+                                "down" if vp["regime"] == "확대" else "up"), unsafe_allow_html=True)
+            vc[2].markdown(card("-8% 손절 도달 확률", f'{vp["hit_stop"]:.0f}%',
+                                "과거 20거래일 구간 기준 이력 빈도",
+                                "down" if vp["hit_stop"] >= 35 else "up"), unsafe_allow_html=True)
+            vc[3].markdown(card("+20% 목표 도달 확률", f'{vp["hit_tgt"]:.0f}%',
+                                "과거 60거래일 구간 기준 이력 빈도",
+                                "up" if vp["hit_tgt"] >= 30 else "mut"), unsafe_allow_html=True)
+            rows = []
+            for r in vp["rows"]:
+                emp = ("—" if np.isnan(r["elo"]) else
+                       f'<span class="mono">{r["elo"]:+.1f}% ~ {r["ehi"]:+.1f}%</span>')
+                pxlo = price * (1 + r["lo"] / 100)
+                pxhi = price * (1 + r["hi"] / 100)
+                rows.append([f'<b>{r["기간"]}</b>',
+                             f'<span class="mono">{r["sigma"]:.1f}%</span>',
+                             f'<span class="mono down">{r["lo"]:+.1f}%</span> ~ '
+                             f'<span class="mono up">{r["hi"]:+.1f}%</span>',
+                             f'<span class="mono">{fmt(pxlo, market)} ~ {fmt(pxhi, market)}</span>',
+                             emp])
+            st.markdown(table(["기간", "표준편차(σ)", "80% 신뢰구간 변동률",
+                               "예상 가격 범위", "실제 이력 10~90%"], rows),
+                        unsafe_allow_html=True)
+            st.markdown(evidence([
+                ("연환산 변동성", f'{vp["ann"]:.1f}%', "40% 미만이면 관리 가능", vp["ann"] < 40),
+                ("변동성 국면", vp["regime"], "안정 또는 축소", vp["regime"] != "확대"),
+                ("수익률 왜도(skew)", f'{vp["skew"]:+.2f}',
+                 "음수면 급락 꼬리가 두꺼움", vp["skew"] >= 0),
+                ("첨도(kurtosis)", f'{vp["kurt"]:.1f}',
+                 "3 이하면 정규분포에 가까움", vp["kurt"] <= 3),
+                ("손절/목표 확률비", f'{vp["hit_stop"]:.0f}% vs {vp["hit_tgt"]:.0f}%',
+                 "목표 확률이 더 높아야 유리", vp["hit_tgt"] >= vp["hit_stop"])]),
+                unsafe_allow_html=True)
+            read_box(
+                f'<b>80% 신뢰구간</b>이란, 앞으로 100번 중 80번은 이 범위 안에서 움직인다는 뜻입니다. '
+                f'(나머지 20번은 위아래로 더 크게 벗어납니다.)<br><br>'
+                f'이 종목은 한 달 기준 <b>{vp["rows"][2]["lo"]:+.1f}% ~ {vp["rows"][2]["hi"]:+.1f}%</b>, '
+                f'가격으로는 <b>{fmt(price*(1+vp["rows"][2]["lo"]/100), market)} ~ '
+                f'{fmt(price*(1+vp["rows"][2]["hi"]/100), market)}</b> 범위가 정상 변동입니다. '
+                f'여기서 <b>-8% 손절선이 이 범위 안에 들어 있다면</b>, 종목에 문제가 없어도 '
+                f'정상적인 흔들림만으로 손절될 수 있다는 뜻입니다.<br><br>'
+                f'실제로 과거 20거래일 구간 중 <b>{vp["hit_stop"]:.0f}%</b>에서 -8% 이상 밀렸고, '
+                f'60거래일 구간 중 <b>{vp["hit_tgt"]:.0f}%</b>에서 +20% 이상 올랐습니다. '
+                + ("목표 도달 확률이 손절 확률보다 높아 기대값이 유리합니다."
+                   if vp["hit_tgt"] >= vp["hit_stop"] else
+                   "손절 도달 확률이 더 높으므로, 진입 시점(피봇 근처)을 더 엄격하게 지켜야 합니다.")
+                + '<br><br>왜도가 음수면 급락 꼬리가 두껍다는 뜻이라, 갑작스러운 하락 위험이 '
+                  '평균보다 큽니다. 첨도가 높으면 평소엔 잠잠하다가 가끔 크게 튄다는 의미입니다.',
+                "80% 신뢰구간이란", "oneil")
 
         step_header("LIQUIDITY", "유동성 · 체결 위험")
         c = st.columns(3)
@@ -2916,9 +3469,9 @@ with TABS[6]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 7 — 사용 가이드
+# TAB 8 — 사용 가이드
 # ════════════════════════════════════════════════════════════════════════════
-with TABS[7]:
+with TABS[8]:
     st.markdown('<div class="masthead"><h1>사용 가이드</h1><div class="sub">'
                 '오닐 기법과 이 앱을 함께 읽는 법</div></div>', unsafe_allow_html=True)
 
@@ -2951,20 +3504,25 @@ with TABS[7]:
 **1단계 · 대시보드** — 오늘 매수 적합도가 몇 점인지 봅니다.
 35점 미만이면 그날은 아무것도 사지 않습니다. 그것만으로 큰 손실의 대부분을 피할 수 있습니다.
 
-**2단계 · 시장 탭** — 다우·S&P·나스닥 세 지수의 FTD와 분산일을 확인합니다.
-분산일이 6개 이상 쌓였다면 보유 종목 비중부터 줄일 준비를 합니다.
+**2단계 · 시장 탭** — 다우·S&P·나스닥 세 지수의 FTD와 분산일, 그리고 공포탐욕지수를 봅니다.
+분산일이 6개 이상 쌓였거나 지수가 극단적 탐욕이면 신규 매수 규모부터 줄입니다.
 
-**3단계 · 개별종목 탭** — 위에서 통과했을 때만 봅니다. STEP 2 베이스 → STEP 5 RS →
-STEP 3 실적 순서로 보고, 하나라도 탈락이면 거기서 멈춥니다.
+**3단계 · 환율 탭** — 미국 주식을 살 계획이면 여기서 환전 비중을 먼저 정합니다.
+환율은 매수 단가의 일부입니다.
 
-**4단계 · STEP 8 시나리오** — 진입가·손절가·수량을 정합니다. 여기서 정한 손절가는
-사기 전에 정하는 것이지, 산 다음에 정하는 게 아닙니다.
+**4단계 · 개별종목 탭** — 위에서 통과했을 때만 봅니다. STEP 2 베이스 → STEP 5 RS →
+STEP 3 실적(3분기·3년) 순서로 보고, 하나라도 탈락이면 거기서 멈춥니다.
+그다음 STEP 8에서 진입가·손절가·수량을 정합니다. 손절가는 **사기 전에** 정하는 것입니다.
 
-**5단계 · STEP 9 매도신호** — 보유 종목이 있다면 여기부터 봅니다. 매도 압력 45점 이상이면
-절반이라도 정리합니다.
+**5단계 · 분석보강 탭** — 80% 신뢰구간으로 이 종목의 정상 변동 폭을 확인합니다.
+-8% 손절선이 정상 변동 범위 안에 들어 있으면 수량을 줄여야 합니다.
+유동성, 실적 발표일, 과거 돌파 승률, 12항목 체크리스트도 여기서 봅니다.
 
-**보조 · 환율 탭** — 미국 주식을 산다면 환전 시점을 나눠서 잡습니다.
+**6단계 · my투자 탭** — 매일 아침 여기부터 보는 게 실전에서는 가장 중요합니다.
+보유 종목별 오늘의 전략(손절/익절/보유)이 자동으로 갱신됩니다.
+
 **보조 · 뉴스 탭** — 뉴스로 사고팔지는 않되, 무슨 일이 있었는지는 압니다.
+**보조 · 종목스캔 탭** — 조회한 종목이 자동으로 쌓입니다. 한 번에 비교할 때 씁니다.
 """)
 
     step_header("TERMS", "용어 풀이")
@@ -3005,6 +3563,10 @@ STEP 3 실적 순서로 보고, 하나라도 탈락이면 거기서 멈춥니다
 | 고점 신호 | 클라이맥스 급등·200일선 이격·최대상승일·최대거래량 음봉·소진갭·레일로드 | 동일 개념 |
 | RS Rating | 0.4×3M + 0.2×(6M·9M·12M) 가중수익률의 백분위 | 80↑, 돌파 시 90↑ |
 | EPS·SMR·Composite | 성장률/마진을 곡선 환산한 **근사값** | IBD 자체 산출 |
+| 실적 판정 | 최근 3분기 각각 +25% 충족 개수 · 최근 3년 이익 증가 개수 | 3분기 연속 25%↑, 3년 연속 증가 |
+| 80% 신뢰구간 | 최근 252일 로그수익률 σ × √기간 × 1.2816 (이력 10~90% 분위수 병기) | 오닐 원전에 없는 보조 지표 |
+| 공포탐욕지수 | 모멘텀·변동성·시장폭·주가강도·안전자산·정크본드 평균 (미국은 CNN 공식값 병기) | 오닐 원전에 없는 보조 지표 |
+| R 배수 | 수익률 ÷ 8% (1R = 손절폭) | 손실 1R, 이익 3R 이상 |
 """)
 
     step_header("MISTAKE", "가장 흔한 실수 5가지")
@@ -3023,4 +3585,197 @@ STEP 3 실적 순서로 보고, 하나라도 탈락이면 거기서 멈춥니다
                 'EPS Rating·SMR·Composite·매수 적합도는 IBD 원본이 아닌 자체 환산 근사값이며, '
                 '뉴스 주제·논조는 제목 키워드 기반 자동 분류입니다. 실적 수치는 공시 원문(DART·SEC) '
                 '대조를 권합니다. 투자 판단과 책임은 이용자 본인에게 있습니다.</div>',
+                unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 7 — my투자
+# ════════════════════════════════════════════════════════════════════════════
+with TABS[7]:
+    st.markdown('<div class="masthead"><h1>my투자</h1><div class="sub">'
+                '보유 종목 오늘의 전략 · 누적 수익률 관리</div></div>', unsafe_allow_html=True)
+    port = load_portfolio()
+
+    with st.expander("보유 종목 추가", expanded=len(port["open"]) == 0):
+        ic = st.columns([1.1, 1, 1, 1, 1.4])
+        in_tk = ic[0].text_input("종목코드/티커", value=TK, key="p_tk")
+        in_dt = ic[1].date_input("매수일", value=datetime.today(), key="p_dt")
+        in_px = ic[2].number_input("매수가", min_value=0.0, value=0.0, format="%.2f", key="p_px")
+        in_qty = ic[3].number_input("수량", min_value=0, value=0, step=1, key="p_qty")
+        in_memo = ic[4].text_input("메모 (선택)", value="", key="p_memo")
+        if st.button("포트폴리오에 추가", type="primary"):
+            if in_tk.strip() and in_px > 0:
+                port["open"].append({"id": f'{in_tk.strip().upper()}-{datetime.now():%Y%m%d%H%M%S}',
+                                     "ticker": in_tk.strip().upper(), "date": str(in_dt),
+                                     "price": float(in_px), "qty": int(in_qty),
+                                     "memo": in_memo.strip()})
+                save_portfolio(port)
+                st.success(f'{in_tk.strip().upper()} 추가 완료')
+            else:
+                st.warning("종목과 매수가를 입력하세요.")
+
+    if not port["open"] and not port["closed"]:
+        st.info("보유 종목을 추가하면 매일 이 화면에서 종목별 오늘의 전략과 누적 수익률을 확인할 수 있습니다.")
+    else:
+        revs = []
+        if port["open"]:
+            with st.spinner("보유 종목 시세 갱신 중…"):
+                for h in port["open"]:
+                    r = position_review(h, zig_pct)
+                    r["h"] = h
+                    revs.append(r)
+        ok_revs = [r for r in revs if r["ok"]]
+
+        if ok_revs:
+            tot_cost = sum(r["cost"] for r in ok_revs)
+            tot_val = sum(r["value"] for r in ok_revs)
+            has_qty = tot_cost > 0
+            avg_ret = (float(np.mean([r["ret"] for r in ok_revs])) if not has_qty
+                       else (tot_val / tot_cost - 1) * 100)
+            winners = sum(1 for r in ok_revs if r["ret"] > 0)
+            mk0 = ok_revs[0]["market"]
+
+            step_header("PORTFOLIO", "누적 현황")
+            pc = st.columns(4)
+            pc[0].markdown(bigcard("총 평가손익",
+                                   (f'{fmt(tot_val - tot_cost, mk0)}{unit(mk0)}' if has_qty
+                                    else f'{avg_ret:+.1f}%'),
+                                   (f'투자 {fmt(tot_cost, mk0)} → 평가 {fmt(tot_val, mk0)}'
+                                    if has_qty else "수량 미입력 — 단순 평균 수익률"),
+                                   "up" if avg_ret >= 0 else "down"), unsafe_allow_html=True)
+            pc[1].markdown(bigcard("수익률", f'{avg_ret:+.1f}%',
+                                   ("금액 가중" if has_qty else "종목 단순 평균")
+                                   + bar(min(100, max(0, avg_ret + 50)),
+                                         color=P_UP if avg_ret >= 0 else P_DOWN),
+                                   "up" if avg_ret >= 0 else "down"), unsafe_allow_html=True)
+            pc[2].markdown(bigcard("보유 종목 수", f'{len(ok_revs)}',
+                                   ("오닐 권장 4~8종목" if 4 <= len(ok_revs) <= 8 else
+                                    "너무 분산되면 관리가 안 됩니다" if len(ok_revs) > 8 else
+                                    "집중도가 높습니다 — 한 종목 실패의 타격이 큽니다"),
+                                   "up" if 4 <= len(ok_revs) <= 8 else "amb"), unsafe_allow_html=True)
+            pc[3].markdown(bigcard("승률", f'{winners}/{len(ok_revs)}',
+                                   "평가익 종목 비율 · 오닐은 손실을 짧게 끊어 "
+                                   "승률 50%로도 수익을 냈습니다"), unsafe_allow_html=True)
+
+            step_header("TODAY", "종목별 오늘의 전략")
+            rows = []
+            for r in sorted(ok_revs, key=lambda x: {"fail": 0, "warn": 1, "idle": 2, "pass": 3}[x["kind"]]):
+                rows.append([
+                    f'<b>{r["name"]}</b><br><span class="mono mut" style="font-size:.7rem">'
+                    f'{r["ticker"]}</span>',
+                    f'<span class="mono">{fmt(r["buy"], r["market"])}</span><br>'
+                    f'<span class="mono mut" style="font-size:.7rem">{r["date"]:%Y-%m-%d}</span>',
+                    f'<span class="mono">{fmt(r["price"], r["market"])}</span>',
+                    f'<span class="mono {"up" if r["ret"]>=0 else "down"}">{r["ret"]:+.1f}%</span><br>'
+                    f'<span class="mono mut" style="font-size:.7rem">R {r["r_mult"]:+.1f}</span>',
+                    f'<span class="mono">{fmt(r["stop"], r["market"])}</span><br>'
+                    f'<span class="mono mut" style="font-size:.7rem">{fmt(r["t1"], r["market"])} 목표</span>',
+                    f'<span class="mono">{r["sp"]["score"]}</span>',
+                    tag(r["act"], r["kind"]),
+                    f'<span class="m">{r["why"]}</span>'])
+            st.markdown(table(["종목", "매수가/일", "현재가", "수익률", "손절/목표",
+                               "매도압력", "오늘의 전략", "근거"], rows), unsafe_allow_html=True)
+
+            urgent = [r for r in ok_revs if r["kind"] == "fail"]
+            if urgent:
+                st.markdown('<br>' + tag(f'즉시 조치 필요 {len(urgent)}건', "fail")
+                            + '<span class="hint"> — '
+                            + " / ".join(f'{r["name"]} {r["act"]}' for r in urgent)
+                            + '</span>', unsafe_allow_html=True)
+
+            for r in ok_revs:
+                with st.expander(f'{r["name"]} 상세 — {r["act"]} ({r["ret"]:+.1f}%)'):
+                    dc = st.columns(4)
+                    dc[0].markdown(card("보유 기간", f'{r["held"]}일',
+                                        f'{r["date"]:%Y-%m-%d} 매수'), unsafe_allow_html=True)
+                    dc[1].markdown(card("매수 후 최고", f'{r["peak_ret"]:+.1f}%',
+                                        f'고점 대비 현재 {r["dd_from_peak"]:+.1f}%',
+                                        "down" if r["dd_from_peak"] <= -10 else "up"),
+                                   unsafe_allow_html=True)
+                    dc[2].markdown(card("이동평균", "50일선 " + ("아래" if r["below50"] else "위"),
+                                        f'50일 {fmt(r["ma50"], r["market"])} · '
+                                        f'200일 {fmt(r["ma200"], r["market"])}',
+                                        "down" if r["below50"] else "up"), unsafe_allow_html=True)
+                    dc[3].markdown(card("R 배수", f'{r["r_mult"]:+.2f}R',
+                                        "1R = 8% · 손실은 -1R에서 끊고 이익은 3R 이상 노립니다",
+                                        "up" if r["r_mult"] > 0 else "down"), unsafe_allow_html=True)
+                    fired = [t for t in r["top"] if t[1]]
+                    if fired:
+                        st.markdown(table(["발생한 고점 신호", "측정", "의미"],
+                                          [[t[0], f'<span class="mono">{t[2]}</span>',
+                                            f'<span class="m">{t[4]}</span>'] for t in fired]),
+                                    unsafe_allow_html=True)
+                    else:
+                        st.markdown('<div class="hint">발생한 고점 신호가 없습니다.</div>',
+                                    unsafe_allow_html=True)
+                    if r["binfo"]:
+                        st.markdown(f'<div class="ev">현재 베이스 · <b>{r["binfo"]["type"]}</b> · '
+                                    f'{r["binfo"]["stage"]} · 피봇 '
+                                    f'{fmt(r["binfo"]["pivot"], r["market"])}</div>',
+                                    unsafe_allow_html=True)
+                    ec = st.columns([1, 1, 3])
+                    if ec[0].button("청산 기록", key=f'close_{r["h"]["id"]}'):
+                        h = r["h"]
+                        port["open"] = [x for x in port["open"] if x["id"] != h["id"]]
+                        port["closed"].append({**h, "sell_date": str(datetime.today().date()),
+                                               "sell_price": r["price"], "ret": r["ret"]})
+                        save_portfolio(port)
+                        st.success(f'{r["name"]} 청산 기록 완료')
+                    if ec[1].button("삭제", key=f'del_{r["h"]["id"]}'):
+                        port["open"] = [x for x in port["open"] if x["id"] != r["h"]["id"]]
+                        save_portfolio(port)
+                        st.info("삭제했습니다")
+
+            read_box(
+                '오닐의 보유 관리는 세 가지 규칙으로 끝납니다.<br><br>'
+                '<b>① -7~8%면 무조건 손절</b> — 이유를 찾지 마세요. 규칙이 판단보다 낫습니다.<br>'
+                '<b>② +20~25%면 익절</b> — 단, 돌파 후 3주 안에 20% 이상 올랐다면 8주는 들고 갑니다. '
+                '진짜 대박 종목이 그렇게 시작하기 때문입니다.<br>'
+                '<b>③ 오른 종목을 팔고 내린 종목을 들고 있지 마세요</b> — 대부분의 투자자가 정반대로 합니다.<br><br>'
+                '위 표의 <b>R 배수</b>는 손실 한 단위(8%)를 1R로 본 수익 배수입니다. '
+                '오닐 방식은 -1R에서 끊고 +3R 이상을 노리는 게임이라, 승률이 40%여도 수익이 납니다.',
+                "보유 종목을 다루는 법", "oneil")
+
+        failed = [r for r in revs if not r["ok"]]
+        if failed:
+            st.markdown('<div class="hint">시세를 못 불러온 종목: '
+                        + ", ".join(r["ticker"] for r in failed) + '</div>', unsafe_allow_html=True)
+
+        if port["closed"]:
+            step_header("CLOSED", "청산 이력 · 실현 손익")
+            cl = pd.DataFrame(port["closed"])
+            rets_ = _clean(cl["ret"].tolist()) if "ret" in cl.columns else []
+            if rets_:
+                wins = [x for x in rets_ if x > 0]
+                loss = [x for x in rets_ if x <= 0]
+                cc2 = st.columns(4)
+                cc2[0].markdown(card("청산 종목", f'{len(rets_)}건', "누적 기록"), unsafe_allow_html=True)
+                cc2[1].markdown(card("승률", f'{len(wins)/len(rets_)*100:.0f}%',
+                                     f'{len(wins)}승 {len(loss)}패',
+                                     "up" if len(wins) >= len(loss) else "mut"), unsafe_allow_html=True)
+                cc2[2].markdown(card("평균 수익 / 평균 손실",
+                                     f'{np.mean(wins) if wins else 0:+.1f}% / '
+                                     f'{np.mean(loss) if loss else 0:+.1f}%',
+                                     "오닐: 평균 수익이 평균 손실의 3배 이상이어야 함",
+                                     "up" if (wins and loss and np.mean(wins) >= abs(np.mean(loss)) * 3)
+                                     else "mut"), unsafe_allow_html=True)
+                cc2[3].markdown(card("누적 평균 수익률", f'{np.mean(rets_):+.1f}%',
+                                     "청산 종목 단순 평균",
+                                     "up" if np.mean(rets_) >= 0 else "down"), unsafe_allow_html=True)
+            need = ["ticker", "date", "price", "sell_date", "sell_price", "ret"]
+            for cnm in need:
+                if cnm not in cl.columns:
+                    cl[cnm] = None
+            show = cl[need].copy()
+            show.columns = ["종목", "매수일", "매수가", "청산일", "청산가", "수익률(%)"]
+            show["수익률(%)"] = pd.to_numeric(show["수익률(%)"], errors="coerce").round(1)
+            st.dataframe(show.iloc[::-1], use_container_width=True, hide_index=True)
+            if st.button("청산 이력 전체 삭제"):
+                port["closed"] = []
+                save_portfolio(port)
+                st.info("청산 이력을 비웠습니다")
+
+    st.markdown('<div class="quote">입력한 보유 내역은 이 앱 서버의 portfolio.json에 저장됩니다. '
+                '재배포하면 초기화될 수 있으니 중요한 기록은 따로 백업하세요. '
+                '수익률은 종가 기준이며 수수료·세금·환율 변동은 반영되지 않습니다.</div>',
                 unsafe_allow_html=True)
