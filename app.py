@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANSLIM TERMINAL  v6.0
+CANSLIM TERMINAL  v7.0
 윌리엄 오닐(William J. O'Neil) 기법 통합 투자 참고 터미널
 
 구성
@@ -470,7 +470,9 @@ def kr_universe():
                                "market": ("KOSDAQ" if "KOSDAQ" in mkt or "코스닥" in mkt
                                           else ("KOSPI" if mkt or typ == "ETF"
                                                 else (prev or {}).get("market", "KOSPI"))),
-                               "type": typ if typ == "ETF" else (prev or {}).get("type", "주식")}
+                               "type": typ if typ == "ETF"
+                                       else ((prev or {}).get("type")
+                                             or guess_kr_type(nm) or "주식")}
                     n0 += 1
                 log.append((f"유니버스 {mk}", "성공", f"{n0:,}종목"))
             except Exception as e:
@@ -494,6 +496,18 @@ def kr_universe():
                 log.append((f"유니버스 {mk}(pykrx)", "성공", f"{len(lst):,}종목 · 신규 {added}"))
             else:
                 log.append((f"유니버스 {mk}(pykrx)", "실패", why))
+        nlst, _wn = krx_try(krx.get_etn_ticker_list, d0)
+        if nlst:
+            for c in nlst:
+                if c in rows:
+                    rows[c]["type"] = "ETN"
+                else:
+                    try:
+                        nm = krx.get_etn_ticker_name(c)
+                    except Exception:
+                        nm = c
+                    rows[c] = {"name": nm, "market": "KOSPI", "type": "ETN"}
+            log.append(("유니버스 ETN(pykrx)", "성공", f"{len(nlst):,}종목"))
         elst, why = krx_try(krx.get_etf_ticker_list, d0)
         if elst:
             for c in elst:
@@ -530,51 +544,147 @@ def kr_name_search(q, limit=15):
     return (exact + partial)[:limit]
 
 
-def resolve_ticker(raw):
-    """입력을 실제 조회 가능한 코드로 해석.
-    반환 (code, market, note, candidates)"""
+ETF_BRAND = ("KODEX", "TIGER", "KBSTAR", "ARIRANG", "HANARO", "KOSEF", "ACE",
+             "SOL", "RISE", "PLUS", "TIMEFOLIO", "히어로즈", "마이티", "마이다스",
+             "WOORI", "BNK", "FOCUS", "TREX", "KIWOOM", "네비게이터", "다올")
+LEV_INV = ("레버리지", "인버스", "2X", "3X", "곱버스", "LEVERAGE", "INVERSE")
+
+
+def guess_kr_type(name):
+    """종목명으로 증권 유형 추정 (유니버스가 비었을 때의 안전망)"""
+    if not name:
+        return None
+    up = str(name).upper()
+    if "ETN" in up:
+        return "ETN"
+    if any(b in up for b in ETF_BRAND) or up.endswith("ETF") or " ETF" in up:
+        return "ETF"
+    return None
+
+
+def is_lev_inv(name):
+    up = str(name or "").upper()
+    return any(k in up for k in LEV_INV)
+
+
+def classify_symbol(raw):
+    """입력 하나로 시장·증권유형까지 확정.
+
+    판정 규칙
+      · 알파벳만으로 이루어짐        → 미국 티커 (BRK.B, BRK-B 포함)
+      · 숫자가 하나라도 포함됨       → 한국 종목코드로 간주하고 정규화·검증
+      · 한글 포함                    → 국내 종목명 검색
+
+    반환 dict:
+      status  'ok' | 'choose' | 'invalid'
+      code, market('KR'|'US'), sec('주식'|'ETF'|'ETN'|'해외'), name,
+      note, candidates, guess(추측 후보 여부)
+    """
+    out = {"status": "invalid", "code": None, "market": None, "sec": None,
+           "name": None, "note": "", "candidates": [], "guess": False}
     s = str(raw or "").strip()
     if not s:
-        return None, None, "", []
+        return out
     up = s.upper().replace(" ", "")
-    digits_only = re.sub(r"[^0-9A-Z]", "", up)     # 한국 코드 매칭용 (하이픈 제거)
 
-    m = re.fullmatch(r"(\d{6})\.(KS|KQ|KRX)", up)
-    if m:
-        return m.group(1), "KR", "접미사 제거", []
-    if re.fullmatch(r"A\d{6}", digits_only):              # A005930 표기
-        return digits_only[1:], "KR", "A접두 제거", []
-    if re.fullmatch(r"\d{6}", digits_only):
-        return digits_only, "KR", "", []
-    if re.fullmatch(r"\d{1,5}", digits_only):
-        uni, _ = kr_universe()
-        cand = digits_only.zfill(6)
-        if cand in uni:
-            return cand, "KR", f"{digits_only} → {cand} 자릿수 보정", []
+    # ① 한글 → 이름 검색
     if re.search(r"[가-힣]", s):
-        c = kr_name_search(s)
+        c = kr_name_search(s, 25)
         if len(c) == 1:
-            return c[0][0], "KR", f"이름 검색 '{s}' → {c[0][1]}", []
+            code, nm, sec, mkt = c[0]
+            return {**out, "status": "ok", "code": code, "market": "KR", "sec": sec,
+                    "name": nm, "note": f"종목명 검색 '{s}' → {nm}"}
         if c:
-            return None, None, f"'{s}' 검색 결과 {len(c)}건 — 아래에서 고르세요", c
-        return None, None, f"'{s}' 검색 결과가 없습니다", []
-    # 6자리 혼합(오타) — 숫자 4자 이상이면 한국 코드 오타로 보고 와일드카드 매칭
-    if len(digits_only) == 6 and sum(ch.isdigit() for ch in digits_only) >= 4 \
-            and not digits_only.isalpha():
-        uni, _ = kr_universe()
-        if uni:
-            pat = re.compile("^" + "".join(ch if ch.isdigit() else "."
-                                           for ch in digits_only) + "$")
-            c = [(k, v["name"], v["type"], v["market"]) for k, v in uni.items() if pat.match(k)]
-            c.sort(key=lambda x: (x[2] != "ETF", x[1]))
-            if len(c) == 1:
-                return c[0][0], "KR", f"'{digits_only}' → {c[0][0]} 오타 보정", []
-            if c:
-                return None, None, (f"'{digits_only}'는 유효한 종목코드가 아닙니다 — "
-                                    "아래 후보에서 고르거나 종목명으로 검색하세요"), c[:15]
-    if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", up):
-        return up, "US", "", []
-    return None, None, f"'{s}'를 해석할 수 없습니다", []
+            return {**out, "status": "choose", "candidates": c,
+                    "note": f"'{s}' 검색 결과 {len(c)}건 — 아래에서 고르세요"}
+        return {**out, "note": f"'{s}' 이름으로 찾은 종목이 없습니다. "
+                               "국내 유니버스 수집 상태를 확인하세요."}
+
+    # ② 숫자 없음 = 알파벳만 → 미국 티커
+    if not re.search(r"\d", up):
+        if re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", up):
+            return {**out, "status": "ok", "code": up, "market": "US", "sec": "해외",
+                    "name": up, "note": ""}
+        return {**out, "note": f"'{s}'는 올바른 해외 티커 형식이 아닙니다."}
+
+    # ③ 숫자 포함 → 한국 종목코드
+    core = up
+    m = re.fullmatch(r"(.{5,6})\.(KS|KQ|KRX)", core)
+    if m:
+        core = m.group(1)
+    if re.fullmatch(r"A\d{6}", core):
+        core = core[1:]
+    core = re.sub(r"[^0-9A-Z]", "", core)
+
+    uni, _ = kr_universe()
+
+    def hit(code):
+        v = uni.get(code)
+        if not v:
+            return None
+        sec = v.get("type") or "주식"
+        g = guess_kr_type(v.get("name"))
+        if g and sec == "주식":          # 목록이 '주식'으로 줘도 명칭이 ETF/ETN이면 정정
+            sec = g
+        return {**out, "status": "ok", "code": code, "market": "KR",
+                "sec": sec, "name": v.get("name"), "note": ""}
+
+    if len(core) == 6:
+        r = hit(core)
+        if r:
+            return r
+        if core.isdigit():
+            if not uni:                       # 유니버스 수집 실패 — 코드는 그대로 사용
+                return {**out, "status": "ok", "code": core, "market": "KR",
+                        "sec": None, "name": None,
+                        "note": "국내 유니버스를 불러오지 못해 유형 판별을 건너뜁니다."}
+            return {**out, "status": "ok", "code": core, "market": "KR",
+                    "sec": None, "name": None,
+                    "note": f"{core}는 상장 목록에 없습니다(상장폐지·신규상장 가능). "
+                            "시세 조회를 시도합니다."}
+
+    if len(core) < 6 and core.isdigit():
+        r = hit(core.zfill(6))
+        if r:
+            return {**r, "note": f"{core} → {core.zfill(6)} 자릿수 보정"}
+
+    # ④ 숫자+문자 혼합 = 잘못된 코드. 자동 점프하지 않고 후보만 '추측'으로 제시
+    cands = []
+    if uni and 5 <= len(core) <= 6:
+        pat = re.compile("^" + "".join(ch if ch.isdigit() else "."
+                                       for ch in core.ljust(6, ".")) + "$")
+        cands = [(k, v["name"], v["type"], v["market"])
+                 for k, v in uni.items() if pat.match(k)]
+        cands.sort(key=lambda x: (x[2] != "ETF", x[1]))
+    base_msg = (f"'{up}'는 올바른 형식이 아닙니다. 한국 종목·ETF 코드는 "
+                "숫자 6자리이고, 해외 종목은 알파벳 티커입니다.")
+    if cands:
+        return {**out, "status": "choose", "candidates": cands[:20], "guess": True,
+                "note": base_msg + " 아래는 숫자 자리만 일치하는 추측 후보라 "
+                                   "실제 종목과 다를 수 있습니다 — 사이드바의 "
+                                   "종목명 검색이나 ETF 목록에서 고르시는 편이 확실합니다."}
+    return {**out, "status": "invalid", "guess": True,
+            "note": base_msg + " 사이드바의 '종목명으로 찾기' 또는 "
+                               "'국내 ETF 목록에서 고르기'를 이용하세요."}
+
+
+def kr_etf_list(keyword="", limit=300):
+    """국내 ETF 목록 (검색어 필터)"""
+    uni, _ = kr_universe()
+    rows = [(c, v["name"], v.get("market", "KOSPI"))
+            for c, v in uni.items()
+            if v.get("type") == "ETF" or guess_kr_type(v.get("name")) == "ETF"]
+    if keyword:
+        k = keyword.strip().lower().replace(" ", "")
+        rows = [r for r in rows if k in r[1].lower().replace(" ", "") or k in r[0]]
+    rows.sort(key=lambda x: x[1])
+    return rows[:limit]
+
+
+def resolve_ticker(raw):
+    """하위 호환 래퍼 → (code, market, note, candidates)"""
+    r = classify_symbol(raw)
+    return r["code"], r["market"], r["note"], r["candidates"]
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -2602,11 +2712,13 @@ def detect_etf(ticker, market, name=""):
                 info["log"].append(("ETF 판별", "성공", "KRX ETF 목록 일치"))
             elif etfs is None:
                 info["log"].append(("ETF 판별", "부분", f"pykrx: {why} — 명칭으로 추정"))
-        if not info["is_etf"] and name:
-            up = name.upper()
-            if any(h.upper() in up for h in KR_ETF_HINT):
+        if not info["is_etf"]:
+            g = guess_kr_type(name)
+            if g in ("ETF", "ETN"):
                 info["is_etf"] = True
-                info["kind"] = "ETF(명칭 추정)"
+                info["kind"] = f"{g}(명칭 추정)"
+                info["log"].append(("ETF 판별", "부분", f"명칭으로 {g} 추정"))
+        info["lev_inv"] = is_lev_inv(name)
         return info
     if HAS_YF:
         try:
@@ -3095,66 +3207,110 @@ with st.sidebar:
     if "tk_input" not in st.session_state:
         st.session_state["tk_input"] = load_json_file(LAST_FILE, {}).get("ticker", "NVDA")
 
+    def _set_symbol(code, market, sec=None, name=None, note=""):
+        st.session_state["tk_active"] = code
+        st.session_state["tk_market"] = market
+        st.session_state["tk_sec"] = sec
+        st.session_state["tk_name"] = name
+        st.session_state["tk_note"] = note
+        st.session_state["tk_cands"] = []
+
     def _apply_ticker():
         raw = str(st.session_state.get("tk_input", "")).strip()
         if not raw:
             return
-        code, mkt, note, cands = resolve_ticker(raw)
-        st.session_state["tk_note"] = note
-        st.session_state["tk_cands"] = cands
-        if code:
-            st.session_state["tk_active"] = code
-            st.session_state["tk_market"] = mkt
+        r = classify_symbol(raw)
+        st.session_state["tk_note"] = r["note"]
+        st.session_state["tk_cands"] = r["candidates"]
+        st.session_state["tk_guess"] = r["guess"]
+        if r["status"] == "ok":
+            _set_symbol(r["code"], r["market"], r["sec"], r["name"], r["note"])
 
     st.text_input("종목코드 · 티커 · 종목명", key="tk_input", on_change=_apply_ticker,
-                  help="한국 6자리(005930) · 해외 티커(NVDA) · 한글 종목명(삼성전자) 모두 가능")
+                  help="한국은 숫자 6자리(005930) · 해외는 알파벳 티커(NVDA) · "
+                       "한글 종목명(삼성전자, 화장품)도 가능")
     if st.button("조회", use_container_width=True, type="primary"):
         _apply_ticker()
 
     if "tk_active" not in st.session_state:
-        _c, _m, _n, _cd = resolve_ticker(st.session_state["tk_input"])
-        st.session_state["tk_active"] = _c or "NVDA"
-        st.session_state["tk_market"] = _m or "US"
-        st.session_state["tk_note"] = _n
-        st.session_state["tk_cands"] = _cd
+        _r = classify_symbol(st.session_state["tk_input"])
+        _set_symbol(_r["code"] or "NVDA", _r["market"] or "US",
+                    _r["sec"], _r["name"], _r["note"])
+        st.session_state["tk_cands"] = _r["candidates"]
+        st.session_state["tk_guess"] = _r["guess"]
 
     cands = st.session_state.get("tk_cands") or []
     if cands:
-        st.warning(st.session_state.get("tk_note") or "여러 종목이 검색되었습니다.")
-        opts = [f'{c} · {n} ({t})' for c, n, t, _m2 in cands]
-        pick = st.selectbox("후보에서 선택", opts, index=None, placeholder="종목을 고르세요")
+        if st.session_state.get("tk_guess"):
+            st.error(st.session_state.get("tk_note") or "존재하지 않는 종목코드입니다.")
+        else:
+            st.info(st.session_state.get("tk_note") or "여러 종목이 검색되었습니다.")
+        opts = [f'{c} · {n} · {t}' for c, n, t, _m2 in cands]
+        pick = st.selectbox("후보에서 선택", opts, index=None, placeholder="종목을 고르세요",
+                            key="cand_pick")
         if pick:
-            st.session_state["tk_active"] = pick.split(" · ")[0]
-            st.session_state["tk_market"] = "KR"
-            st.session_state["tk_cands"] = []
-            st.session_state["tk_note"] = ""
+            _c2 = pick.split(" · ")
+            _set_symbol(_c2[0], "KR", _c2[2], _c2[1])
+            st.session_state["tk_input"] = _c2[0]
             st.rerun()
-    elif st.session_state.get("tk_note"):
-        st.caption("↳ " + st.session_state["tk_note"])
 
     ticker_in = st.session_state["tk_active"]
     forced_market = st.session_state.get("tk_market")
     _uni, _unilog = kr_universe()
     _meta = _uni.get(ticker_in) if forced_market == "KR" else None
-    st.caption(f'현재 분석 중 · **{ticker_in}**'
-               + (f' · {_meta["name"]} ({_meta["type"]})' if _meta else ''))
+    _sec = (_meta or {}).get("type") or st.session_state.get("tk_sec")
+    _nm = (_meta or {}).get("name") or st.session_state.get("tk_name")
+    if forced_market == "KR" and not _sec:
+        _sec = guess_kr_type(_nm)
+    st.session_state["tk_sec"] = _sec
+
+    _badge = ("🇰🇷 한국" if forced_market == "KR" else "🇺🇸 해외")
+    _tbadge = {"ETF": "ETF", "ETN": "ETN", "주식": "주식",
+               "해외": "주식", None: "유형 확인 중"}.get(_sec, str(_sec))
+    st.markdown(f'<div class="card" style="padding:.55rem .7rem;margin:.2rem 0 .4rem">'
+                f'<div class="k">현재 분석 대상</div>'
+                f'<div class="v" style="font-size:1rem">{ticker_in}'
+                + (f' <span style="font-size:.78rem;font-weight:500">{_nm}</span>' if _nm else '')
+                + f'</div><div class="d">{_badge} · <b>{_tbadge}</b>'
+                + (' · <span style="color:#B3261E">레버리지/인버스</span>'
+                   if is_lev_inv(_nm) else '') + '</div></div>',
+                unsafe_allow_html=True)
+    if is_lev_inv(_nm):
+        st.caption("⚠ 레버리지·인버스 상품은 장기 보유 시 가치가 감소합니다. "
+                   "오닐식 베이스·실적 분석이 적용되지 않습니다.")
+    if st.session_state.get("tk_note") and not cands:
+        st.caption("↳ " + st.session_state["tk_note"])
 
     with st.expander("종목명으로 찾기 (한국)"):
         kw = st.text_input("검색어", value="", key="kw_search",
                            placeholder="예: 화장품, 반도체, 삼성")
         if kw:
-            hits = kr_name_search(kw, 20)
+            hits = kr_name_search(kw, 25)
             if hits:
                 for c, n, t, m2 in hits:
                     if st.button(f'{c} · {n} · {t}', key=f'sr_{c}',
                                  use_container_width=True):
-                        st.session_state["tk_active"] = c
-                        st.session_state["tk_market"] = "KR"
+                        _set_symbol(c, "KR", t, n)
                         st.session_state["tk_input"] = c
-                        st.session_state["tk_cands"] = []
                         st.rerun()
             else:
                 st.caption("검색 결과가 없습니다. 국내 유니버스 수집 상태를 확인하세요.")
+
+    with st.expander("국내 ETF 목록에서 고르기"):
+        ekw = st.text_input("ETF 검색", value="", key="etf_search",
+                            placeholder="예: 화장품, 반도체, 배당, 미국")
+        elist = kr_etf_list(ekw, 60)
+        if elist:
+            st.caption(f"{len(elist)}건 표시 (전체 국내 ETF "
+                       f"{len(kr_etf_list('', 100000)):,}종목)")
+            for c, n, m2 in elist[:40]:
+                if st.button(f'{c} · {n}', key=f'ef_{c}', use_container_width=True):
+                    _set_symbol(c, "KR", "ETF", n)
+                    st.session_state["tk_input"] = c
+                    st.rerun()
+        else:
+            st.caption("ETF 목록을 불러오지 못했습니다. "
+                       "아래 '데이터 소스 진단'에서 유니버스 상태를 확인하세요.")
     st.markdown("---")
     capital = st.number_input("투자 가능 금액", min_value=0, value=0, step=1000000,
                               help="0이면 수량 계산을 생략합니다")
@@ -3281,10 +3437,16 @@ def sticky_bar(ctx, D, extra=""):
     cls = "up" if chg >= 0 else "down"
     parts = [f'<span class="nm">{ctx["name"].split(" (")[0]}</span>',
              f'<span class="px {cls}">{fmt(price, m)}{unit(m)} {pct(chg,2)}</span>']
-    if ctx.get("etf", {}).get("is_etf"):
-        parts.append('<span class="it">' + tag("ETF", "info") + '</span>')
-    if ctx.get("seg"):
-        parts.append(f'<span class="it">{"코스닥" if ctx["seg"]=="KOSDAQ" else "코스피"}</span>')
+    _sec2 = ctx.get("sec_hint") or ("ETF" if ctx.get("etf", {}).get("is_etf") else None)
+    if m == "KR":
+        _lbl = f'코스닥 · {_sec2 or "주식"}' if ctx.get("seg") == "KOSDAQ" \
+            else f'코스피 · {_sec2 or "주식"}'
+        parts.append('<span class="it">' +
+                     tag(_lbl, "info" if _sec2 in ("ETF", "ETN") else "idle") + '</span>')
+    else:
+        parts.append('<span class="it">' + tag("해외 · 주식", "idle") + '</span>')
+    if ctx.get("etf", {}).get("lev_inv"):
+        parts.append('<span class="it">' + tag("레버리지/인버스", "fail") + '</span>')
     if bw:
         k = "up" if bw["kind"] == "pass" else ("amb" if bw["kind"] == "warn" else "down")
         parts.append(f'<span class="it">시장 <b class="{k}">{bw["score"]}점 {bw["grade"]}</b></span>')
@@ -3304,6 +3466,8 @@ def sticky_bar(ctx, D, extra=""):
 
 
 CTX = build_context(TK, forced_market)
+if CTX.get("ok"):
+    CTX["sec_hint"] = st.session_state.get("tk_sec")
 
 if CTX.get("ok") and TK:
     save_json_file(LAST_FILE, {"ticker": TK, "at": datetime.now().isoformat(timespec="seconds")})
@@ -3389,7 +3553,11 @@ with TABS[0]:
             f'<span class="mono amb" style="font-size:1.05rem">{fmt(price, market)}'
             f'{unit(market)}</span> <span class="mono {"up" if chg>=0 else "down"}" '
             f'style="font-size:.9rem">{pct(chg,2)}</span></h1>'
-            f'<div class="sub">오늘의 브리핑 · {df.index[-1]:%Y-%m-%d} 종가 기준 · '
+            f'<div class="sub">'
+            + ("한국 " + ("코스닥 " if CTX.get("seg") == "KOSDAQ" else "코스피 ")
+               + (CTX.get("sec_hint") or ("ETF" if CTX.get("etf", {}).get("is_etf") else "주식"))
+               if market == "KR" else "해외 주식")
+            + f' · 오늘의 브리핑 · {df.index[-1]:%Y-%m-%d} 종가 기준 · '
             f'데이터 {df.index[0]:%Y-%m-%d}부터 {len(df):,}거래일</div></div>',
             unsafe_allow_html=True)
 
@@ -3606,6 +3774,11 @@ with TABS[3]:
         df, market, price, ma = CTX["df"], CTX["market"], CTX["price"], CTX["ma"]
         binfo, fnd = CTX["binfo"], CTX["fnd"]
         sticky_bar(CTX, D)
+        if CTX.get("etf", {}).get("lev_inv"):
+            st.error("레버리지·인버스 상품입니다. 일일 수익률을 배수로 추종하도록 설계돼 "
+                     "장기 보유 시 기초지수와 괴리가 누적됩니다(변동성 끌림). "
+                     "오닐의 베이스·실적 분석은 이런 상품에 적용되지 않으니 "
+                     "아래 분석은 참고용으로만 보세요.")
         st.markdown(f'<div class="masthead"><h1>{CTX["name"]}</h1><div class="sub">'
                     f'STEP 1 추세 · 2 베이스 · 3 실적 · 4 밸류 · 5 상대강도 · 6 수급 · '
                     f'7 종합 · 8 시나리오 · 9 매도신호</div></div>', unsafe_allow_html=True)
@@ -4819,13 +4992,24 @@ STEP 3 실적(3분기·3년) 순서로 보고, 하나라도 탈락이면 거기�
 - **외국인 지분율** — 순매수 금액보다 정확한 매집 지표입니다. 금액은 단기 트레이딩일 수 있지만
   지분율이 꾸준히 오르면 실제로 물량을 쌓고 있다는 뜻입니다.
 
-**종목 입력 요령**
+**종목 입력 요령 — 판정 규칙은 단순합니다**
 
-- 한국: 6자리 코드(`005930`), 자릿수가 모자라도 자동 보정(`5930`), `.KS`/`A` 접두도 인식
-- 오타가 섞이면(`0008t0`) 비슷한 코드 후보를 띄워줍니다
-- **한글 종목명으로도 찾습니다** — `삼성전자`, `화장품`, `반도체`처럼 입력하면 후보가 나옵니다
-- 사이드바의 "종목명으로 찾기"에서 검색해 버튼으로 바로 선택할 수 있습니다
-- 해외: 티커 그대로(`NVDA`, `BRK-B`)
+| 입력 형태 | 판정 |
+|---|---|
+| 알파벳만 (`NVDA`, `AAPL`, `BRK-B`) | 해외 주식 |
+| 숫자가 포함됨 (`005930`, `069500`) | 한국 종목코드 |
+| 한글 (`삼성전자`, `화장품`) | 국내 종목명 검색 |
+
+한국 코드는 6자리 숫자로 확정한 뒤 **상장 목록과 대조해 주식 / ETF / ETN을 즉시 구별**하고,
+사이드바에 유형 배지로 표시합니다. 자릿수가 모자라면 자동 보정(`5930` → `005930`),
+`.KS` 접미사나 `A` 접두도 인식합니다.
+
+숫자와 문자가 섞인 잘못된 코드(`0008t0`)는 **엉뚱한 종목으로 자동 이동하지 않습니다.**
+추측 후보를 "정확하지 않을 수 있음"으로 명시해 보여주고, 종목명 검색이나
+**국내 ETF 목록에서 고르기**를 안내합니다.
+
+레버리지·인버스 상품은 자동으로 감지해 경고합니다. 일일 수익률을 배수로 추종하는 구조라
+장기 보유 시 기초지수와 괴리가 누적되고, 오닐식 베이스·실적 분석이 적용되지 않습니다.
 
 **한국 종목 재무가 비어 있을 때**
 
@@ -4864,7 +5048,7 @@ ROE·영업이익률·부채비율·분기 손익계산서를 대신 채웁니�
 | 한국 수급 | 외국인·기관·개인 5/20/60일 순매수 + 외국인 지분율 변화 + 공매도 잔고 | 기관 매집 확인 |
 | ETF 분석 | 구성종목 비중 가중 재무(look-through) + 실효 종목수 | 오닐 원전에 없음 |
 | 한국 재무 보강 | 네이버 → pykrx → yfinance(.KS/.KQ) 순차 병합, 빈 항목만 채움 | — |
-| 종목 해석 | 6자리 코드 · 자릿수 보정 · 오타 와일드카드 · 한글명 검색 | — |
+| 종목 해석 | 알파벳=해외 / 숫자=한국 · 상장목록 대조로 주식·ETF·ETN 구별 | — |
 """)
 
     step_header("MISTAKE", "가장 흔한 실수 5가지")
@@ -5286,5 +5470,6 @@ with TABS[4]:
                     '모양이 보이게 됩니다. 오닐도 "수천 개의 차트를 직접 그려봤다"고 했습니다.</div>',
                     unsafe_allow_html=True)
     to_top()
+
 
 
