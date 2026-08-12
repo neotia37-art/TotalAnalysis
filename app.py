@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANSLIM TERMINAL  v9.0
+CANSLIM TERMINAL  v10.0
 윌리엄 오닐(William J. O'Neil) 기법 통합 투자 참고 터미널
 
 구성
@@ -1178,8 +1178,156 @@ def _stmt_tab(stmt):
     return t[sorted(t.columns)]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def yf_info(ticker, tries=3):
+    """yfinance info를 여러 경로로 시도. (dict, 출처) 반환.
+    .info는 자주 비거나 429가 나므로 fast_info / get_info를 함께 쓴다."""
+    if not HAS_YF:
+        return {}, "yfinance 미설치"
+    tk = yf.Ticker(ticker)
+    last = ""
+    for i in range(tries):
+        for how in ("get_info", "info"):
+            try:
+                d = tk.get_info() if how == "get_info" else tk.info
+                if d and len(d) > 5:
+                    return dict(d), f"yfinance {how}"
+            except Exception as e:
+                last = f"{how}: {type(e).__name__}"
+        try:
+            fi = tk.fast_info
+            d = {}
+            for k_src, k_dst in [("last_price", "currentPrice"),
+                                 ("market_cap", "marketCap"),
+                                 ("shares", "sharesOutstanding"),
+                                 ("year_high", "fiftyTwoWeekHigh"),
+                                 ("year_low", "fiftyTwoWeekLow"),
+                                 ("currency", "currency")]:
+                try:
+                    v = getattr(fi, k_src, None)
+                    if v is not None:
+                        d[k_dst] = v
+                except Exception:
+                    continue
+            if d:
+                return d, "yfinance fast_info"
+        except Exception as e:
+            last = f"fast_info: {type(e).__name__}"
+    return {}, last or "응답 없음"
+
+
+def _first_row(*cands):
+    """여러 후보 중 값이 있는 첫 Series 반환 (Series에 or 연산 금지)"""
+    for c in cands:
+        if c is not None and len(c):
+            return c
+    return None
+
+
+def _row(stmt, *names):
+    """손익/재무상태표에서 항목 시계열 추출"""
+    if stmt is None or getattr(stmt, "empty", True):
+        return None
+    for n in names:
+        hit = [r for r in stmt.index if str(r).strip() == n]
+        if not hit:
+            hit = [r for r in stmt.index if n.lower() in str(r).lower()]
+        if hit:
+            try:
+                s = stmt.loc[hit[0]].astype(float).dropna()
+                if len(s):
+                    return s
+            except Exception:
+                continue
+    return None
+
+
+def derive_from_statements(tk_obj, price, F):
+    """info가 비어도 재무제표 + 주가로 핵심 지표를 직접 계산한다."""
+    notes = []
+    try:
+        q = tk_obj.quarterly_income_stmt
+        a = tk_obj.income_stmt
+        qb = tk_obj.quarterly_balance_sheet
+        ab = tk_obj.balance_sheet
+    except Exception as e:
+        return F, [("재무제표", "실패", type(e).__name__)]
+    if q is not None and not q.empty:
+        q = q.iloc[:, ::-1]
+    if a is not None and not a.empty:
+        a = a.iloc[:, ::-1]
+    if qb is not None and not qb.empty:
+        qb = qb.iloc[:, ::-1]
+    if ab is not None and not ab.empty:
+        ab = ab.iloc[:, ::-1]
+
+    eps_q = _row(q, "Diluted EPS", "Basic EPS")
+    if eps_q is not None and len(eps_q) >= 4:
+        ttm_eps = float(eps_q.iloc[-4:].sum())
+        if F.get("eps_ttm") is None:
+            F["eps_ttm"] = ttm_eps
+        if F.get("per") is None and ttm_eps > 0 and price:
+            F["per"] = price / ttm_eps
+            notes.append(("PER", "성공", "주가 ÷ 최근 4분기 EPS 합"))
+    ni = _row(q, "Net Income", "Net Income Common Stockholders")
+    rev = _row(q, "Total Revenue")
+    op = _row(q, "Operating Income")
+    if rev is not None and len(rev) >= 4:
+        rev4 = float(rev.iloc[-4:].sum())
+        if op is not None and len(op) >= 4 and rev4 > 0 and F.get("opm") is None:
+            F["opm"] = float(op.iloc[-4:].sum()) / rev4 * 100
+            notes.append(("영업이익률", "성공", "최근 4분기 영업이익 ÷ 매출"))
+        if ni is not None and len(ni) >= 4 and rev4 > 0 and F.get("npm") is None:
+            F["npm"] = float(ni.iloc[-4:].sum()) / rev4 * 100
+        if F.get("psr") is None and price and F.get("shares") and rev4 > 0:
+            F["psr"] = price * F["shares"] / rev4
+    eq = _first_row(_row(qb, "Stockholders Equity", "Total Equity Gross Minority Interest"),
+                    _row(ab, "Stockholders Equity", "Total Equity Gross Minority Interest"))
+    if eq is not None and len(eq) and ni is not None and len(ni) >= 4:
+        e0 = float(eq.iloc[-1])
+        if e0 > 0:
+            if F.get("roe") is None:
+                F["roe"] = float(ni.iloc[-4:].sum()) / e0 * 100
+                notes.append(("ROE", "성공", "최근 4분기 순이익 ÷ 자본총계"))
+            sh = _first_row(_row(qb, "Ordinary Shares Number", "Share Issued"),
+                            _row(ab, "Ordinary Shares Number", "Share Issued"))
+            if sh is not None and len(sh) and float(sh.iloc[-1]) > 0:
+                if F.get("shares") is None:
+                    F["shares"] = float(sh.iloc[-1])
+                bps = e0 / float(sh.iloc[-1])
+                if F.get("bps") is None:
+                    F["bps"] = bps
+                if F.get("pbr") is None and price and bps > 0:
+                    F["pbr"] = price / bps
+                    notes.append(("PBR", "성공", "주가 ÷ 주당순자산"))
+                if F.get("mktcap") is None and price:
+                    F["mktcap"] = price * float(sh.iloc[-1])
+    debt = _first_row(_row(qb, "Total Debt"), _row(ab, "Total Debt"))
+    if debt is not None and eq is not None and len(debt) and len(eq) \
+            and float(eq.iloc[-1]) > 0 and F.get("debt") is None:
+        F["debt"] = float(debt.iloc[-1]) / float(eq.iloc[-1]) * 100
+        notes.append(("부채비율", "성공", "총부채 ÷ 자본총계"))
+    if F.get("q_tab") is None and q is not None and not q.empty:
+        F["q_tab"] = _stmt_tab(q)
+    if F.get("y_tab") is None and a is not None and not a.empty:
+        F["y_tab"] = _stmt_tab(a)
+    if eps_q is not None:
+        F["q_series"] = eps_q
+        if F.get("q_eps") is None and len(eps_q) >= 5:
+            F["q_eps"], F["q_eps_prev"] = float(eps_q.iloc[-1]), float(eps_q.iloc[-5])
+    eps_y = _row(a, "Diluted EPS", "Basic EPS")
+    if eps_y is not None:
+        F["y_series"] = eps_y
+        if F.get("y_eps") is None and len(eps_y) >= 2:
+            F["y_eps"], F["y_eps_prev2"] = float(eps_y.iloc[-1]), float(eps_y.iloc[-2])
+    if rev is not None and len(rev) >= 5 and float(rev.iloc[-5]) > 0 \
+            and F.get("q_sales") is None:
+        F["q_sales"] = float(rev.iloc[-1] / rev.iloc[-5] - 1) * 100
+    return F, notes
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_us_fund(ticker):
+def load_us_fund(ticker, price=None):
     F = {k: None for k in ["q_eps", "q_eps_prev", "y_eps", "y_eps_prev2", "q_sales", "roe",
                            "debt", "opm", "npm", "per", "fper", "pbr", "psr", "peg", "mktcap",
                            "inst", "insider", "float", "shares", "sector", "industry",
@@ -1187,16 +1335,11 @@ def load_us_fund(ticker):
     F.update({"table": None, "q_series": None, "y_series": None, "q_tab": None,
               "y_tab": None, "log": [], "src": []})
     if not HAS_YF:
+        F["log"].append(("US 기업정보", "실패", "yfinance 미설치"))
         return F
     tk = yf.Ticker(ticker)
-    info = {}
-    for _ in range(2):
-        try:
-            info = tk.info or {}
-            if len(info) > 5:
-                break
-        except Exception:
-            continue
+
+    info, isrc = yf_info(ticker)
     if info:
         F["per"], F["fper"] = safe(info.get("trailingPE")), safe(info.get("forwardPE"))
         F["pbr"], F["psr"] = safe(info.get("priceToBook")), safe(info.get("priceToSalesTrailing12Months"))
@@ -1211,10 +1354,19 @@ def load_us_fund(ticker):
         F["float"], F["shares"] = safe(info.get("floatShares")), safe(info.get("sharesOutstanding"))
         F["sector"], F["industry"] = info.get("sector"), info.get("industry")
         F["div"] = (safe(info.get("dividendYield")) or 0) or None
-        F["src"].append("yfinance info")
-        F["log"].append(("US 기업정보", "성공", "yfinance info"))
+        F["eps_ttm"] = safe(info.get("trailingEps"))
+        F["src"].append(isrc)
+        F["log"].append(("US 기업정보", "성공", f"{isrc} · {len(info)}개 항목"))
     else:
-        F["log"].append(("US 기업정보", "실패", "info 응답 없음(요청 제한 가능)"))
+        F["log"].append(("US 기업정보", "부분",
+                         f"info 응답 없음({isrc}) — 재무제표로 직접 산출합니다"))
+
+    F, notes = derive_from_statements(tk, price, F)
+    for n in notes:
+        F["log"].append((f"직접 산출 · {n[0]}", n[1], n[2]))
+    if notes:
+        F["src"].append("재무제표 직접 산출")
+
     try:
         cal = tk.calendar
         if isinstance(cal, dict):
@@ -1225,43 +1377,14 @@ def load_us_fund(ticker):
             F["next_earnings"] = pd.to_datetime(cal.loc["Earnings Date"].iloc[0])
     except Exception:
         pass
-    try:
-        q = tk.quarterly_income_stmt
-        if q is not None and not q.empty:
-            q = q.iloc[:, ::-1]
-            er = [r for r in q.index if "Diluted EPS" in str(r)]
-            if er:
-                s = q.loc[er[0]].astype(float).dropna()
-                F["q_series"] = s
-                if len(s) >= 5:
-                    F["q_eps"], F["q_eps_prev"] = float(s.iloc[-1]), float(s.iloc[-5])
-            rv = [r for r in q.index if str(r) == "Total Revenue"]
-            if rv:
-                s = q.loc[rv[0]].astype(float).dropna()
-                if len(s) >= 5 and s.iloc[-5] > 0:
-                    F["q_sales"] = float(s.iloc[-1] / s.iloc[-5] - 1) * 100
-            keep = [r for r in q.index if str(r) in
-                    ("Total Revenue", "Operating Income", "Net Income", "Diluted EPS")]
-            if keep:
-                F["table"] = q.loc[keep]
-                F["q_tab"] = _stmt_tab(q)
-            F["src"].append("yfinance 분기 손익")
-            F["log"].append(("US 분기실적", "성공", "quarterly_income_stmt"))
-    except Exception as e:
-        F["log"].append(("US 분기실적", "실패", type(e).__name__))
-    try:
-        a = tk.income_stmt
-        if a is not None and not a.empty:
-            a = a.iloc[:, ::-1]
-            r = [x for x in a.index if "Diluted EPS" in str(x)]
-            if r:
-                s = a.loc[r[0]].astype(float).dropna()
-                F["y_series"] = s
-                if len(s) >= 2:
-                    F["y_eps"], F["y_eps_prev2"] = float(s.iloc[-1]), float(s.iloc[-2])
-            F["y_tab"] = _stmt_tab(a)
-    except Exception:
-        pass
+    if F.get("q_tab") is not None:
+        keep = [r for r in ("매출액", "영업이익", "순이익", "EPS") if r in F["q_tab"].index]
+        if keep:
+            F["table"] = F["q_tab"].loc[keep]
+    got = sum(1 for k in ("per", "pbr", "roe", "opm", "debt", "q_eps", "y_eps", "mktcap")
+              if F.get(k) is not None)
+    F["log"].append(("US 재무 충족도", "성공" if got >= 6 else ("부분" if got >= 3 else "실패"),
+                     f"{got}/8 항목 확보"))
     return F
 
 
@@ -2977,61 +3100,6 @@ def detect_etf(ticker, market, name=""):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_etf_holdings(ticker, market):
-    """ETF 구성종목 + 비중"""
-    out = {"df": None, "src": None, "log": [], "asof": None}
-    if market == "KR" and HAS_KRX:
-        for back in range(0, 12):
-            d = ymd(bday(back))
-            try:
-                pdf = krx.get_etf_portfolio_deposit_file(d, ticker)
-                if pdf is not None and not pdf.empty:
-                    pdf = pdf.reset_index()
-                    ncol = pdf.columns[0]
-                    wcol = next((c for c in pdf.columns if "비중" in str(c)), None)
-                    vcol = next((c for c in pdf.columns if "금액" in str(c) or "평가" in str(c)), None)
-                    t = pd.DataFrame({"종목": pdf[ncol].astype(str)})
-                    if wcol is not None:
-                        t["비중"] = pd.to_numeric(pdf[wcol], errors="coerce")
-                    elif vcol is not None:
-                        v = pd.to_numeric(pdf[vcol], errors="coerce")
-                        t["비중"] = v / v.sum() * 100
-                    else:
-                        continue
-                    t = t.dropna(subset=["비중"])
-                    t = t[t["비중"] > 0].sort_values("비중", ascending=False)
-                    if len(t):
-                        out.update({"df": t.reset_index(drop=True), "src": "pykrx PDF", "asof": d})
-                        out["log"].append(("ETF 구성종목", "성공", f"pykrx PDF · {d} · {len(t)}종목"))
-                        return out
-            except Exception:
-                continue
-        out["log"].append(("ETF 구성종목", "실패", "pykrx PDF 응답 없음"))
-        return out
-    if HAS_YF:
-        try:
-            f = yf.Ticker(ticker).funds_data
-            h = f.top_holdings
-            if h is not None and not h.empty:
-                t = h.reset_index()
-                ncol = next((c for c in t.columns if "Name" in str(c)), t.columns[0])
-                wcol = next((c for c in t.columns if "Percent" in str(c) or "Holding" in str(c)), None)
-                sym = t.columns[0]
-                out_t = pd.DataFrame({"종목": t[ncol].astype(str),
-                                      "티커": t[sym].astype(str)})
-                if wcol is not None:
-                    w = pd.to_numeric(t[wcol], errors="coerce")
-                    out_t["비중"] = w * 100 if w.max() <= 1.5 else w
-                out_t = out_t.dropna(subset=["비중"]).sort_values("비중", ascending=False)
-                out.update({"df": out_t.reset_index(drop=True), "src": "yfinance funds_data"})
-                out["log"].append(("ETF 구성종목", "성공", f"yfinance · 상위 {len(out_t)}종목"))
-                return out
-        except Exception as e:
-            out["log"].append(("ETF 구성종목", "실패", type(e).__name__))
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def etf_lookthrough(holdings, market, top_n=10):
     """구성종목 비중 가중 재무지표 (look-through)"""
     if holdings is None or holdings.empty:
@@ -3041,18 +3109,9 @@ def etf_lookthrough(holdings, market, top_n=10):
     for _, r in h.iterrows():
         nm = str(r["종목"]).strip()
         w = float(r["비중"])
-        tk = None
-        if market == "KR":
-            if HAS_KRX:
-                try:
-                    for code, cname in _krx_name_map().items():
-                        if cname == nm:
-                            tk = code
-                            break
-                except Exception:
-                    pass
-        else:
-            tk = str(r.get("티커", "")).strip() or None
+        tk = str(r.get("코드", "")).strip() or None
+        if tk and market == "KR":
+            tk = tk.zfill(6)
         f = None
         if tk:
             try:
@@ -3076,24 +3135,6 @@ def etf_lookthrough(holdings, market, top_n=10):
                 agg[col] = float((sub[col] * sub["비중"]).sum() / sub["비중"].sum())
                 agg[col + "_cov"] = float(sub["비중"].sum() / wsum * 100) if wsum else np.nan
     return {"table": t, "agg": agg, "cover": wsum}
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _krx_name_map():
-    m = {}
-    if not HAS_KRX:
-        return m
-    try:
-        d = datetime.today().strftime("%Y%m%d")
-        for mk in ("KOSPI", "KOSDAQ"):
-            for c in krx.get_market_ticker_list(d, market=mk):
-                try:
-                    m[c] = krx.get_market_ticker_name(c)
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return m
 
 
 def etf_concentration(h):
@@ -3410,6 +3451,290 @@ ONEIL_TIPS = [
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 엔진 ⑯ ETF 종합 분석 (재구성)
+# ════════════════════════════════════════════════════════════════════════════
+RET_WINDOWS = [("1개월", 21), ("3개월", 63), ("6개월", 126),
+               ("12개월", 252), ("24개월", 504), ("36개월", 756)]
+
+
+def period_returns(df, windows=RET_WINDOWS):
+    """기간별 수익률 + 연환산"""
+    out = []
+    c = df["Close"].dropna()
+    for lab, n in windows:
+        if len(c) > n:
+            r = float(c.iloc[-1] / c.iloc[-n - 1] - 1) * 100
+            yrs = n / 252
+            cagr = ((1 + r / 100) ** (1 / yrs) - 1) * 100 if yrs >= 1 and r > -100 else np.nan
+            out.append({"기간": lab, "일수": n, "수익률": r, "연환산": cagr})
+        else:
+            out.append({"기간": lab, "일수": n, "수익률": np.nan, "연환산": np.nan})
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_etf_profile(code, market):
+    """ETF 핵심 지표: 보수·순자산·NAV·괴리율·추적오차·분배금"""
+    P = {"expense": None, "aum": None, "nav": None, "deviation": None,
+         "track_err": None, "yield_": None, "category": None, "index_name": None,
+         "turnover": None, "log": [], "src": []}
+    if market == "KR":
+        if HAS_KRX:
+            o, why = krx_try(krx.get_etf_ohlcv_by_date, ymd(bday(20)), ymd(bday()), code)
+            if o is not None and len(o):
+                for col, key in [("NAV", "nav"), ("기초지수", "index_val"),
+                                 ("거래대금", "turnover")]:
+                    if col in o.columns:
+                        P[key] = safe(o[col].iloc[-1])
+                P["src"].append("pykrx ETF OHLCV")
+                P["log"].append(("ETF NAV", "성공", "pykrx"))
+            else:
+                P["log"].append(("ETF NAV", "실패", f"pykrx: {why}"))
+            d, why2 = krx_try(krx.get_etf_price_deviation, ymd(bday(20)), ymd(bday()), code)
+            if d is not None and "괴리율" in d.columns and len(d):
+                P["deviation"] = safe(d["괴리율"].iloc[-1])
+                P["dev_series"] = d["괴리율"].tail(60)
+                P["log"].append(("괴리율", "성공", "pykrx"))
+            else:
+                P["log"].append(("괴리율", "실패", f"pykrx: {why2}"))
+            t, why3 = krx_try(krx.get_etf_tracking_error, ymd(bday(20)), ymd(bday()), code)
+            if t is not None and len(t):
+                col = next((c for c in t.columns if "추적" in str(c)), None)
+                if col:
+                    P["track_err"] = safe(t[col].iloc[-1])
+                    P["log"].append(("추적오차", "성공", "pykrx"))
+            else:
+                P["log"].append(("추적오차", "실패", f"pykrx: {why3}"))
+            cap, _w = krx_try(krx.get_market_cap, ymd(bday(20)), ymd(bday()), code)
+            if cap is not None and len(cap) and "시가총액" in cap.columns:
+                P["aum"] = safe(cap["시가총액"].iloc[-1])
+        # 총보수 — 네이버 ETF 상세
+        try:
+            url = f"https://finance.naver.com/item/coinfo.naver?code={code}"
+            html = requests.get(url, timeout=8, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}).text
+            m = re.search(r"총\s*보수[^0-9]{0,20}([0-9]+\.?[0-9]*)\s*%", html)
+            if m:
+                P["expense"] = float(m.group(1))
+                P["log"].append(("총보수", "성공", "네이버 ETF 상세"))
+            m2 = re.search(r"기초지수[^가-힣A-Za-z0-9]{0,20}([^<]{4,40})", html)
+            if m2:
+                P["index_name"] = m2.group(1).strip()
+        except Exception as e:
+            P["log"].append(("총보수", "실패", f"네이버: {type(e).__name__}"))
+        return P
+
+    if HAS_YF:
+        info, isrc = yf_info(code)
+        if info:
+            P["aum"] = safe(info.get("totalAssets"))
+            P["category"] = info.get("category")
+            P["yield_"] = (safe(info.get("yield")) or 0) * 100 or None
+            P["nav"] = safe(info.get("navPrice"))
+            e = safe(info.get("netExpenseRatio"))
+            if e is None:
+                e = (safe(info.get("annualReportExpenseRatio")) or 0) * 100 or None
+            P["expense"] = e
+            P["src"].append(isrc)
+        try:
+            fd = yf.Ticker(code).funds_data
+            ops = fd.fund_operations
+            if ops is not None and not ops.empty:
+                for idx in ops.index:
+                    if "Expense" in str(idx):
+                        v = safe(ops.loc[idx].iloc[0])
+                        if v is not None and P["expense"] is None:
+                            P["expense"] = v * 100 if v < 1 else v
+                P["log"].append(("ETF 운영지표", "성공", "yfinance funds_data"))
+            ov = fd.fund_overview
+            if isinstance(ov, dict):
+                P["category"] = P["category"] or ov.get("categoryName")
+        except Exception as e:
+            P["log"].append(("ETF 운영지표", "실패", f"funds_data: {type(e).__name__}"))
+    return P
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_etf_holdings(ticker, market):
+    """ETF 구성종목 + 비중. (인자 순서 정정: pykrx는 ticker, date)"""
+    out = {"df": None, "src": None, "log": [], "asof": None}
+    if market == "KR" and HAS_KRX:
+        for back in range(0, 12):
+            d = ymd(bday(back))
+            try:
+                pdf = krx.get_etf_portfolio_deposit_file(ticker, d)   # ← 순서 정정
+                if pdf is None or pdf.empty:
+                    continue
+                p = pdf.reset_index()
+                ccol = p.columns[0]                    # 인덱스가 구성종목 티커
+                wcol = next((c for c in p.columns if "비중" in str(c)), None)
+                vcol = next((c for c in p.columns if "금액" in str(c)), None)
+                t = pd.DataFrame({"코드": p[ccol].astype(str).str.zfill(6)})
+                if wcol is not None:
+                    t["비중"] = pd.to_numeric(p[wcol], errors="coerce")
+                elif vcol is not None:
+                    v = pd.to_numeric(p[vcol], errors="coerce")
+                    t["비중"] = v / v.sum() * 100
+                else:
+                    continue
+                uni, _ = kr_universe()
+                t["종목"] = t["코드"].map(lambda x: (uni.get(x) or {}).get("name") or x)
+                t = t.dropna(subset=["비중"])
+                t = t[t["비중"] > 0].sort_values("비중", ascending=False)
+                if len(t):
+                    out.update({"df": t[["종목", "코드", "비중"]].reset_index(drop=True),
+                                "src": "pykrx PDF", "asof": d})
+                    out["log"].append(("ETF 구성종목", "성공",
+                                       f"pykrx PDF · {d} · {len(t)}종목"))
+                    return out
+            except Exception:
+                continue
+        out["log"].append(("ETF 구성종목", "실패", "pykrx PDF 응답 없음(휴장·미제공)"))
+        return out
+    if HAS_YF:
+        try:
+            h = yf.Ticker(ticker).funds_data.top_holdings
+            if h is not None and not h.empty:
+                t = h.reset_index()
+                sym = t.columns[0]
+                ncol = next((c for c in t.columns if "Name" in str(c)), sym)
+                wcol = next((c for c in t.columns
+                             if "Percent" in str(c) or "Holding" in str(c)), None)
+                o = pd.DataFrame({"종목": t[ncol].astype(str),
+                                  "코드": t[sym].astype(str)})
+                if wcol is not None:
+                    w = pd.to_numeric(t[wcol], errors="coerce")
+                    o["비중"] = w * 100 if w.max() <= 1.5 else w
+                o = o.dropna(subset=["비중"]).sort_values("비중", ascending=False)
+                out.update({"df": o.reset_index(drop=True), "src": "yfinance top_holdings"})
+                out["log"].append(("ETF 구성종목", "성공", f"yfinance · 상위 {len(o)}종목"))
+                return out
+        except Exception as e:
+            out["log"].append(("ETF 구성종목", "실패", f"yfinance: {type(e).__name__}"))
+    return out
+
+
+def etf_keywords(name):
+    """ETF 명칭에서 브랜드를 걷어내고 테마 키워드만 추출"""
+    nm = str(name or "")
+    for b in ETF_BRAND:
+        nm = re.sub(re.escape(b.strip()), " ", nm, flags=re.I)
+    nm = re.sub(r"\(.*?\)|합성|H\)|TR|PR|증권상장지수투자신탁|상장지수|ETF|ETN", " ", nm)
+    toks = [t for t in re.split(r"[\s\-_/·]+", nm) if len(t) >= 2]
+    return [t for t in toks if not re.fullmatch(r"[0-9]+", t)]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_peer_etfs(code, name, market, holdings_codes=None, limit=6):
+    """유사 ETF 후보: ① 명칭 키워드 겹침 ② 구성종목 겹침(가능할 때)"""
+    peers, log = [], []
+    if market != "KR":
+        log.append(("유사 ETF", "실패", "국내 ETF만 지원"))
+        return peers, log
+    uni, _ = kr_universe()
+    kws = etf_keywords(name)
+    if not kws:
+        log.append(("유사 ETF", "실패", "명칭에서 테마 키워드를 뽑지 못함"))
+        return peers, log
+    cands = []
+    for c, v in uni.items():
+        if c == code or kr_sec_type(v.get("name"), v.get("type")) != "ETF":
+            continue
+        nm = v.get("name") or ""
+        hit = sum(1 for k in kws if k in nm)
+        if hit:
+            cands.append((hit, c, nm))
+    cands.sort(key=lambda x: (-x[0], x[2]))
+    cands = cands[:limit * 3]
+
+    if holdings_codes:
+        base = set(holdings_codes)
+        scored = []
+        for hit, c, nm in cands[:limit * 2]:
+            h = load_etf_holdings(c, "KR")
+            ov = np.nan
+            if h["df"] is not None and "코드" in h["df"].columns:
+                other = set(h["df"]["코드"].tolist())
+                if other:
+                    ov = len(base & other) / len(base | other) * 100
+            scored.append((hit, ov, c, nm))
+        scored.sort(key=lambda x: (-(x[1] if x[1] == x[1] else -1), -x[0]))
+        peers = [{"code": c, "name": nm, "kw": hit, "overlap": ov}
+                 for hit, ov, c, nm in scored[:limit]]
+        log.append(("유사 ETF", "성공", f"명칭+구성종목 겹침으로 {len(peers)}건"))
+    else:
+        peers = [{"code": c, "name": nm, "kw": hit, "overlap": np.nan}
+                 for hit, c, nm in cands[:limit]]
+        log.append(("유사 ETF", "부분", f"명칭 키워드만으로 {len(peers)}건"))
+    return peers, log
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def peer_return_table(base_code, base_name, peers, market):
+    """본 ETF와 유사 ETF의 기간별 수익률 비교표"""
+    rows = []
+    for code, nm, mark, extra in ([(base_code, base_name, True, {})] +
+                                  [(p["code"], p["name"], False, p) for p in peers]):
+        try:
+            d, mk, _n, _l = load_price(code, "KR" if market == "KR" else None)
+            if d is None or len(d) < 30:
+                continue
+            r = {"코드": code, "종목": nm, "기준": mark,
+                 "겹침": extra.get("overlap") if extra else np.nan}
+            for lab, n in RET_WINDOWS:
+                c = d["Close"].dropna()
+                r[lab] = (float(c.iloc[-1] / c.iloc[-n - 1] - 1) * 100
+                          if len(c) > n else np.nan)
+            r["거래대금"] = float((d["Close"] * d["Volume"]).tail(20).mean())
+            rows.append(r)
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def etf_verdict(P, conc, rets, dev, fo_ratio):
+    """ETF 투자 판단 요약 — 항목별 점수와 근거"""
+    items, score, total = [], 0, 0
+
+    def add(label, ok, meas, std, weight, why):
+        nonlocal score, total
+        total += weight
+        if ok:
+            score += weight
+        items.append((label, meas, std, ok, why))
+
+    if P.get("expense") is not None:
+        add("총보수", P["expense"] <= 0.5, f'{P["expense"]:.2f}%', "0.50% 이하", 20,
+            "매년 빠져나가는 비용. 0.1%p 차이가 10년이면 크게 벌어집니다")
+    if P.get("aum"):
+        aum_ok = P["aum"] >= 1e11 if True else False
+        add("순자산(시가총액)", aum_ok,
+            (f'{P["aum"]/1e12:,.2f}조원' if P["aum"] >= 1e12 else f'{P["aum"]/1e8:,.0f}억원'),
+            "1,000억원 이상", 20,
+            "너무 작으면 상장폐지·유동성 위험이 있습니다")
+    if dev is not None:
+        add("괴리율", abs(dev) <= 0.5, f'{dev:+.2f}%', "±0.5% 이내", 15,
+            "시장가와 순자산가치의 차이. 크면 비싸게 사거나 싸게 파는 것입니다")
+    if P.get("track_err") is not None:
+        add("추적오차", P["track_err"] <= 1.0, f'{P["track_err"]:.2f}%', "1.0% 이하", 15,
+            "기초지수를 얼마나 정확히 따라가는가")
+    if conc:
+        add("분산도", conc["eff_n"] >= 8, f'실효 {conc["eff_n"]:.1f}종목',
+            "8종목 이상", 15, "실효 종목수가 적으면 ETF라도 개별 종목처럼 움직입니다")
+    r12 = next((r["수익률"] for r in rets if r["기간"] == "12개월"), None)
+    if r12 is not None and not np.isnan(r12):
+        add("12개월 수익률", r12 > 0, pct(r12), "0% 초과", 15,
+            "장기 성과. 유사 ETF와 비교하는 것이 더 중요합니다")
+    if fo_ratio is not None:
+        items.append(("외국인 지분율", f'{fo_ratio:.2f}%', "참고", None,
+                      "ETF는 개별주와 달리 외국인 비중이 낮은 편입니다"))
+    pctg = int(round(score / total * 100)) if total else 0
+    grade = ("양호" if pctg >= 75 else "보통" if pctg >= 50 else "주의")
+    kind = ("pass" if pctg >= 75 else "warn" if pctg >= 50 else "fail")
+    return {"items": items, "score": pctg, "grade": grade, "kind": kind}
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 관심종목 저장 (누적)
 # ════════════════════════════════════════════════════════════════════════════
 def load_watchlist():
@@ -3684,7 +4009,9 @@ def build_context(tk, force_market=None):
                     f'({pv_chk["gap"]:+.1f}%)'))
     etfinfo = detect_etf(tk, market, name)
     seg0 = kr_segment(tk) if market == "KR" else None
-    fnd = load_kr_fund_all(tk, seg0) if market == "KR" else load_us_fund(tk)
+    _px0 = float(dfd["Close"].iloc[-1])
+    fnd = (load_kr_fund_all(tk, seg0) if market == "KR"
+           else load_us_fund(tk, _px0))
     states = {nm: index_state(idf, min_gain, corr_pct) for nm, idf in idxs.items()}
     uni = load_rs_universe(market)
     bw = buy_window(states, breadth_pct(uni)) if states else None
@@ -4257,100 +4584,197 @@ with TABS[3]:
                                      "돌파후 최대(%)": None if fwd is None else round(fwd, 1)})
                     st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True)
 
-        # STEP 3 — ETF는 구성종목 기반 분석으로 대체
-        IS_ETF = bool(CTX.get("etf", {}).get("is_etf"))
+        # STEP 3 — ETF는 전용 분석 프레임으로 대체
+        IS_ETF = bool(CTX.get("etf", {}).get("is_etf")) or CTX.get("sec_hint") in ("ETF", "ETN")
         if IS_ETF:
-            step_header("STEP 3", "ETF 구성종목 분석", "ETF는 자체 실적이 없어 담고 있는 종목으로 판단")
             ei = CTX["etf"]
+            EP = load_etf_profile(TK, market)
             hold = load_etf_holdings(TK, market)
             H = hold["df"]
             conc = etf_concentration(H) if H is not None else None
+            rets_tbl = period_returns(df)
+            fo_ratio = None
+            if market == "KR":
+                _sup = D["flowinfo"].get("sup") if isinstance(D.get("flowinfo"), dict) else None
+                fo_ratio = (_sup or {}).get("fo_ratio")
+            V = etf_verdict(EP, conc, rets_tbl, EP.get("deviation"), fo_ratio)
 
-            ec = st.columns(4)
-            ec[0].markdown(card("유형", ei.get("kind") or "ETF",
-                                ei.get("cat") or ("국내 상장 ETF" if market == "KR" else "—"),
-                                "amb"), unsafe_allow_html=True)
-            ec[1].markdown(card("보유 종목 수",
-                                f'{conc["n"]}종목' if conc else "—",
-                                (f'실효 종목수 {conc["eff_n"]:.1f}개 · 비중 편중 감안'
-                                 if conc else "구성종목 미수집")), unsafe_allow_html=True)
-            ec[2].markdown(card("상위 집중도",
-                                f'{conc["top10"]:.1f}%' if conc else "—",
-                                (f'1위 {conc["top1"]:.1f}% · 상위5 {conc["top5"]:.1f}%<br>'
-                                 f'실효 {conc["eff_n"]:.1f}종목 · HHI {conc["hhi"]:.0f} · '
-                                 f'<b>{conc["level"]}</b>' if conc else ""),
-                                "down" if (conc and conc["eff_n"] < 8) else "up"),
+            step_header("ETF 1", "핵심 지표", "ETF는 자체 실적이 없어 비용·규모·추종품질로 봅니다")
+            ec = st.columns(5)
+            ec[0].markdown(card("총보수 (연)",
+                                f'{num(EP.get("expense"),2)}%' if EP.get("expense") is not None else "미수집",
+                                "매년 자산에서 차감 · 0.5% 이하 양호",
+                                "up" if (EP.get("expense") or 9) <= 0.5 else "down"),
                            unsafe_allow_html=True)
-            ec[3].markdown(card("보수 / 배당수익률",
-                                f'{num(ei.get("expense"),2)}% / {num(ei.get("yield_"),2)}%',
-                                "보수는 장기 수익률을 갉아먹습니다"), unsafe_allow_html=True)
+            _aum = EP.get("aum")
+            ec[1].markdown(card("순자산 (시가총액)",
+                                (f'{_aum/1e12:,.2f}조원' if _aum and _aum >= 1e12 else
+                                 f'{_aum/1e8:,.0f}억원' if _aum and market == "KR" else
+                                 f'${_aum/1e9:,.2f}B' if _aum else "미수집"),
+                                "작으면 상장폐지·유동성 위험",
+                                "up" if (_aum or 0) >= 1e11 else "mut"), unsafe_allow_html=True)
+            ec[2].markdown(card("괴리율", pct(EP.get("deviation"), 2),
+                                "시장가 vs 순자산가치 · ±0.5% 이내",
+                                "up" if abs(EP.get("deviation") or 9) <= 0.5 else "down"),
+                           unsafe_allow_html=True)
+            ec[3].markdown(card("추적오차",
+                                f'{num(EP.get("track_err"),2)}%' if EP.get("track_err") is not None else "미수집",
+                                "기초지수 추종 정확도 · 1% 이하",
+                                "up" if (EP.get("track_err") or 9) <= 1.0 else "mut"),
+                           unsafe_allow_html=True)
+            ec[4].markdown(card("외국인 지분율",
+                                f'{fo_ratio:.2f}%' if fo_ratio is not None else
+                                (pct(EP.get("yield_"), 2, False) if EP.get("yield_") else "미수집"),
+                                "외국인 보유 비중" if fo_ratio is not None else "배당수익률"),
+                           unsafe_allow_html=True)
+            if EP.get("index_name"):
+                st.markdown(f'<div class="ev">기초지수 · <b>{EP["index_name"]}</b></div>',
+                            unsafe_allow_html=True)
 
-            if H is not None and len(H):
-                lt = etf_lookthrough(H, market, 10)
-                st.markdown('<div class="hint" style="margin:.4rem 0"><b>구성종목 상위</b> · '
-                            f'출처 {hold["src"]}'
-                            + (f' · 기준일 {hold["asof"]}' if hold.get("asof") else "")
-                            + '</div>', unsafe_allow_html=True)
-                rows = []
-                for _, r_ in H.head(15).iterrows():
-                    w = float(r_["비중"])
-                    rows.append([f'<b>{r_["종목"]}</b>',
-                                 f'<span class="mono">{w:.2f}%</span>',
-                                 f'<div class="bar" style="width:110px"><div style="width:'
-                                 f'{min(100, w/max(1e-9, float(H["비중"].max()))*100):.0f}%;'
-                                 f'background:{P_ACC}"></div></div>'])
-                st.markdown(table(["구성 종목", "비중", ""], rows), unsafe_allow_html=True)
-
-                if lt and lt["agg"]:
-                    a_ = lt["agg"]
-                    st.markdown('<br><div class="hint"><b>비중 가중 재무지표 (look-through)</b> — '
-                                '구성종목의 재무를 투자 비중으로 가중평균한 값입니다</div>',
-                                unsafe_allow_html=True)
-                    lc = st.columns(4)
-                    for i_, (k_, lab_, std_) in enumerate([
-                            ("PER", "가중 PER", "낮을수록 저평가"),
-                            ("ROE", "가중 ROE", "17% 이상이면 우량"),
-                            ("부채비율", "가중 부채비율", "낮을수록 안전"),
-                            ("분기EPS증감", "가중 분기 EPS 증감", "+25% 이상이면 성장")]):
-                        v_ = a_.get(k_)
-                        cov = a_.get(k_ + "_cov")
-                        lc[i_].markdown(card(lab_, num(v_, 1),
-                                             f'{std_}<br>커버리지 {num(cov,0)}%',
-                                             "up" if (k_ == "ROE" and (v_ or 0) >= 17) or
-                                                     (k_ == "분기EPS증감" and (v_ or 0) >= 25) or
-                                                     (k_ == "부채비율" and v_ is not None and v_ < 150)
-                                             else "mut"), unsafe_allow_html=True)
-                    with st.expander("구성종목별 재무 상세"):
-                        st.dataframe(lt["table"], use_container_width=True, hide_index=True)
-                    st.markdown(evidence([
-                        ("가중 ROE", num(a_.get("ROE"), 1) + "%", "17% 이상",
-                         (a_.get("ROE") or 0) >= 17),
-                        ("가중 분기 EPS 증감", pct(a_.get("분기EPS증감")), "+25% 이상",
-                         (a_.get("분기EPS증감") or 0) >= 25),
-                        ("상위 10종목 집중도", f'{conc["top10"]:.1f}%' if conc else "—",
-                         "80% 미만이면 분산", bool(conc and conc["top10"] < 80)),
-                        ("실효 종목수", f'{conc["eff_n"]:.1f}개' if conc else "—",
-                         "8개 이상", bool(conc and conc["eff_n"] >= 8))]),
+            step_header("ETF 2", "기간별 수익률", "1 · 3 · 6 · 12 · 24 · 36개월")
+            rrows = []
+            for r_ in rets_tbl:
+                v = r_["수익률"]
+                cl = "up" if (v == v and v > 0) else ("down" if v == v else "mut")
+                rrows.append([f'<b>{r_["기간"]}</b>',
+                              f'<span class="mono {cl}">{pct(v)}</span>',
+                              f'<span class="mono mut">{pct(r_["연환산"]) if r_["연환산"] == r_["연환산"] else "—"}</span>',
+                              f'<span class="mono mut">{r_["일수"]}거래일</span>'])
+            st.markdown(table(["기간", "수익률", "연환산(CAGR)", "구간"], rrows),
                         unsafe_allow_html=True)
+
+            step_header("ETF 3", "구성종목과 투자비율")
+            if H is not None and len(H):
+                st.markdown('<div class="hint">출처 ' + str(hold["src"])
+                            + (f' · 기준일 {hold["asof"]}' if hold.get("asof") else "")
+                            + f' · {len(H)}종목</div>', unsafe_allow_html=True)
+                cc2 = st.columns([2, 1])
+                with cc2[0]:
+                    wmax = float(H["비중"].max())
+                    hrows = []
+                    for _, r_ in H.head(20).iterrows():
+                        w = float(r_["비중"])
+                        hrows.append([f'<b>{r_["종목"]}</b>',
+                                      f'<span class="mono mut">{r_.get("코드","")}</span>',
+                                      f'<span class="mono">{w:.2f}%</span>',
+                                      f'<div class="bar" style="width:120px"><div style="width:'
+                                      f'{min(100, w/max(wmax,1e-9)*100):.0f}%;background:{P_ACC}">'
+                                      f'</div></div>'])
+                    st.markdown(table(["구성 종목", "코드", "비중", ""], hrows),
+                                unsafe_allow_html=True)
+                with cc2[1]:
+                    if conc:
+                        st.markdown(card("집중도", conc["level"],
+                                         f'실효 {conc["eff_n"]:.1f}종목 · HHI {conc["hhi"]:.0f}<br>'
+                                         f'1위 {conc["top1"]:.1f}% · 상위5 {conc["top5"]:.1f}%<br>'
+                                         f'상위10 {conc["top10"]:.1f}% · 전체 {conc["n"]}종목',
+                                         "down" if conc["eff_n"] < 8 else "up"),
+                                    unsafe_allow_html=True)
+                    lt = etf_lookthrough(H, market, 10)
+                    if lt and lt["agg"]:
+                        a_ = lt["agg"]
+                        st.markdown("<br>" + table(["비중가중 지표", "값", "커버리지"],
+                                                   [[k, num(a_.get(k), 1),
+                                                     f'{num(a_.get(k + "_cov"),0)}%']
+                                                    for k in ("PER", "ROE", "부채비율",
+                                                              "분기EPS증감")
+                                                    if a_.get(k) is not None]),
+                                    unsafe_allow_html=True)
+                with st.expander("구성종목 전체 · 재무 상세"):
+                    st.dataframe(H, use_container_width=True, hide_index=True)
+                    lt2 = etf_lookthrough(H, market, 10)
+                    if lt2:
+                        st.dataframe(lt2["table"], use_container_width=True, hide_index=True)
             else:
-                st.markdown('<div class="hint">구성종목을 불러오지 못했습니다. '
+                st.markdown('<div class="hint">구성종목을 불러오지 못했습니다 — '
                             + " · ".join(x[2] for x in hold["log"]) + '</div>',
                             unsafe_allow_html=True)
 
+            step_header("ETF 4", "유사 ETF 수익률 비교", "같은 테마의 다른 상품과 견줍니다")
+            _hcodes = H["코드"].tolist() if (H is not None and "코드" in H.columns) else None
+            peers, plog = find_peer_etfs(TK, CTX["name"].split(" (")[0], market, _hcodes, 6)
+            if peers:
+                cmp_df = peer_return_table(TK, CTX["name"].split(" (")[0], peers, market)
+                if not cmp_df.empty:
+                    prows = []
+                    for _, r_ in cmp_df.iterrows():
+                        nm_ = (f'<b>{r_["종목"]}</b> ' + tag("기준", "info")) if r_["기준"] \
+                            else r_["종목"]
+                        cells = [nm_, f'<span class="mono mut">{r_["코드"]}</span>']
+                        for lab, _n in RET_WINDOWS:
+                            v = r_.get(lab)
+                            if v is None or v != v:
+                                cells.append("—")
+                            else:
+                                cl = "up" if v > 0 else "down"
+                                cells.append(f'<span class="mono {cl}">{v:+.1f}%</span>')
+                        ov = r_.get("겹침")
+                        cells.append(f'<span class="mono mut">'
+                                     f'{ov:.0f}%</span>' if ov == ov and ov is not None else "—")
+                        prows.append(cells)
+                    st.markdown(table(["ETF", "코드"] + [w[0] for w in RET_WINDOWS] + ["구성겹침"],
+                                      prows), unsafe_allow_html=True)
+                    base_r = cmp_df[cmp_df["기준"]]
+                    if len(base_r):
+                        b12 = base_r.iloc[0].get("12개월")
+                        others = cmp_df[~cmp_df["기준"]]["12개월"].dropna()
+                        if b12 == b12 and len(others):
+                            rank = int((others > b12).sum()) + 1
+                            read_box(
+                                f'12개월 수익률 기준으로 유사 ETF {len(others)+1}개 중 '
+                                f'<b>{rank}위</b>입니다. '
+                                + ("같은 테마라면 성과가 앞서는 상품을 고르는 것이 합리적입니다. "
+                                   "다만 총보수와 순자산 규모도 함께 보세요 — 수익률이 조금 낮아도 "
+                                   "보수가 싸고 규모가 크면 장기적으로 유리할 수 있습니다."
+                                   if rank > 1 else
+                                   "같은 테마 상품 중 성과가 가장 좋습니다. "
+                                   "다만 과거 수익률이 미래를 보장하지 않으므로 "
+                                   "총보수·괴리율·규모를 함께 확인하세요."),
+                                "유사 ETF 비교")
+                st.caption(" · ".join(x[2] for x in plog))
+            else:
+                st.markdown('<div class="hint">유사 ETF를 찾지 못했습니다 — '
+                            + " · ".join(x[2] for x in plog) + '</div>', unsafe_allow_html=True)
+
+            step_header("ETF 5", "투자 판단 요약")
+            vc = st.columns([1, 2.2])
+            vc[0].markdown(bigcard("ETF 종합 판정",
+                                   f'{V["score"]}<span style="font-size:1rem">/100</span>',
+                                   f'<b>{V["grade"]}</b>' + bar(V["score"]),
+                                   "up" if V["kind"] == "pass" else
+                                   ("amb" if V["kind"] == "warn" else "down")),
+                           unsafe_allow_html=True)
+            vrows2 = []
+            for lab, meas, std, ok, why in V["items"]:
+                vrows2.append([lab, f'<span class="mono">{meas}</span>', std,
+                               (tag("참고", "idle") if ok is None else verdict(ok)),
+                               f'<span class="m">{why}</span>'])
+            vc[1].markdown(table(["항목", "측정", "기준", "판정", "왜 보는가"], vrows2),
+                           unsafe_allow_html=True)
+
+            if EP.get("log") or hold.get("log"):
+                with st.expander("ETF 데이터 수집 상태"):
+                    st.markdown(table(["항목", "상태", "내용"],
+                                      [[a, tag(b_, "pass" if b_ == "성공" else
+                                               ("warn" if b_ == "부분" else "fail")), c_]
+                                       for a, b_, c_ in (EP.get("log", []) + hold.get("log", []))]),
+                                unsafe_allow_html=True)
+
             read_box(
-                'ETF는 회사가 아니라 <b>종목 묶음</b>이라 자체 실적(EPS·ROE)이 없습니다. '
-                '그래서 담고 있는 종목들의 재무를 <b>투자 비중으로 가중평균</b>해서 봅니다. '
-                '이걸 look-through 분석이라고 합니다.<br><br>'
-                '<b>집중도</b>가 중요합니다. <b>실효 종목수</b>는 "비중을 감안하면 실제로 몇 종목에 '
-                '투자한 셈인가"를 뜻합니다. 50종목을 담아도 상위 3개가 60%면 실효 종목수는 '
-                '5~6개에 불과합니다. 8개 미만이면 ETF라도 개별 종목처럼 움직이므로 '
-                '분산 효과를 기대하기 어렵습니다. 반대로 40개를 넘으면 지수와 거의 같이 가서 '
-                '오닐식 초과수익을 내기 어렵습니다.<br><br>'
-                '오닐 관점에서 ETF는 <b>M(시장)과 업종 흐름을 타는 도구</b>입니다. '
-                'C·A(개별 실적)는 적용되지 않지만, <b>N(신고가)·L(상대강도)·S(거래량)·M(시장)</b>과 '
-                '베이스 판정은 그대로 유효합니다. 위 STEP 1·2·5와 아래 STEP 4~9를 그대로 보시면 됩니다.<br><br>'
-                '보수(expense ratio)는 매년 빠져나가는 비용입니다. 0.5%와 0.05% 차이는 '
-                '10년이면 무시 못 할 크기가 됩니다.', "ETF를 보는 법", "oneil")
+                'ETF는 회사가 아니라 <b>종목 묶음</b>이라 EPS·ROE 같은 자체 실적이 없습니다. '
+                '대신 다음 다섯 가지로 판단합니다.<br><br>'
+                '<b>① 총보수</b> — 매년 자산에서 빠져나가는 비용입니다. 0.5%와 0.05%는 '
+                '10년이면 무시 못 할 차이가 됩니다. 같은 지수를 추종하면 보수가 싼 쪽이 정답입니다.<br>'
+                '<b>② 순자산 규모</b> — 너무 작으면 거래가 안 되고 상장폐지 위험도 있습니다.<br>'
+                '<b>③ 괴리율</b> — 시장가와 실제 자산가치의 차이입니다. 플러스면 비싸게 사는 것이고, '
+                '±0.5%를 넘나들면 매매 타이밍에 주의해야 합니다.<br>'
+                '<b>④ 추적오차</b> — 기초지수를 얼마나 정확히 따라가는가입니다.<br>'
+                '<b>⑤ 구성종목과 집중도</b> — 실효 종목수가 8개 미만이면 ETF라도 개별 종목처럼 '
+                '움직여 분산 효과가 없습니다.<br><br>'
+                '오닐 관점에서 ETF는 <b>시장·업종 흐름을 타는 도구</b>입니다. '
+                'C·A(개별 실적)는 적용되지 않지만 <b>N(신고가)·L(상대강도)·S(거래량)·M(시장)</b>과 '
+                '베이스 판정은 그대로 유효하니 STEP 1·2·5와 아래 단계를 함께 보세요.',
+                "ETF를 보는 다섯 가지 기준", "oneil")
 
             FH = {"q": None, "y": None, "q_kind": "", "y_kind": "",
                   "q_pass": None, "y_pass": None, "accel": None}
@@ -4483,8 +4907,10 @@ with TABS[3]:
                 st.markdown('<div class="hint">' + tag("일부 항목 미수집", "warn")
                             + ' 아래 항목이 비어 있습니다 — '
                             + ", ".join(_miss)
-                            + '. 위 입력란에 공시 수치를 넣으면 판정에 즉시 반영됩니다. '
-                              '한국 종목은 네이버 → pykrx → yfinance(.KS/.KQ) 순으로 시도합니다.</div>',
+                            + '. 위 입력란에 공시 수치를 넣으면 판정에 즉시 반영됩니다.<br>'
+                              '한국은 네이버 → pykrx → yfinance(.KS/.KQ), '
+                              '해외는 yfinance info → fast_info → <b>재무제표 직접 산출</b> '
+                              '순으로 시도합니다.</div>',
                             unsafe_allow_html=True)
             if fnd.get("table") is not None:
                 with st.expander("원본 실적표"):
@@ -5405,7 +5831,8 @@ ROE·영업이익률·부채비율·분기 손익계산서를 대신 채웁니�
 | R 배수 | 수익률 ÷ 8% (1R = 손절폭) | 손실 1R, 이익 3R 이상 |
 | RS 라인 기준지수 | 한국은 소속 시장(코스피/코스닥) 지수, 미국은 시장 국면이 가장 좋은 지수 | 해당 시장 지수 |
 | 한국 수급 | 외국인·기관·개인 5/20/60일 순매수 + 외국인 지분율 변화 + 공매도 잔고 | 기관 매집 확인 |
-| ETF 분석 | 구성종목 비중 가중 재무(look-through) + 실효 종목수 | 오닐 원전에 없음 |
+| ETF 분석 | 총보수·순자산·괴리율·추적오차·집중도·기간수익률·유사ETF 비교 | 오닐 원전에 없음 |
+| 해외 재무 | info 실패 시 재무제표로 PER·PBR·ROE·마진·부채비율 직접 계산 | — |
 | 한국 재무 보강 | 네이버 → pykrx → yfinance(.KS/.KQ) 순차 병합, 빈 항목만 채움 | — |
 | 종목 해석 | 상장목록 대조 → 시세 프로브 검증 → 알파벳만이면 해외. 형식 단정 안 함 | — |
 | 증권 유형 | 보통주 · 우선주 · ETF · ETN · 신주인수권 (목록 + 명칭 규칙) | — |
