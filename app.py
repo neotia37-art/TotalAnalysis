@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANSLIM TERMINAL  v5.0
+CANSLIM TERMINAL  v6.0
 윌리엄 오닐(William J. O'Neil) 기법 통합 투자 참고 터미널
 
 구성
@@ -41,11 +41,33 @@ try:
     HAS_YF = True
 except Exception:
     HAS_YF = False
+# KRX 자격증명이 있으면 pykrx 임포트 전에 환경변수로 주입 (선택 사항)
 try:
-    from pykrx import stock as krx
-    HAS_KRX = True
+    _sec = st.secrets
+    for _k in ("KRX_ID", "KRX_PW"):
+        if _k in _sec and _sec[_k]:
+            os.environ[_k] = str(_sec[_k])
 except Exception:
-    HAS_KRX = False
+    pass
+
+import contextlib
+import io as _io
+
+HAS_KRX = False
+KRX_NOTE = ""
+try:
+    _buf = _io.StringIO()
+    with contextlib.redirect_stdout(_buf):          # 로그인 실패 안내문 잡음 억제
+        from pykrx import stock as krx
+    HAS_KRX = True
+    _msg = _buf.getvalue()
+    if "로그인 실패" in _msg:
+        KRX_NOTE = "비인증 세션 (KRX 계정 미설정 — 대부분 조회는 정상 동작)"
+    elif "로그인 완료" in _msg:
+        KRX_NOTE = "KRX 인증 세션"
+except Exception as _e:
+    krx = None
+    KRX_NOTE = f"pykrx 임포트 실패: {type(_e).__name__}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -68,7 +90,7 @@ html, body, [class*="css"], .stApp{ font-family:'Pretendard',system-ui,sans-seri
 section[data-testid="stSidebar"]{ background:var(--card); border-right:1px solid var(--line); }
 section[data-testid="stSidebar"] *{ color:var(--ink); }
 [data-testid="stHeader"]{ background:transparent; }
-.block-container{ padding-top:2rem; max-width:1400px; }
+.block-container{ padding-top:1.1rem; max-width:1400px; }
 
 h1,h2,h3{ color:var(--ink); }
 .stTabs [data-baseweb="tab-list"]{ gap:2px; border-bottom:1px solid var(--line); }
@@ -162,11 +184,25 @@ table.chk tr:last-child td{ border-bottom:none; }
 
 .hint{ font-size:.78rem; color:var(--ink2); line-height:1.65; }
 
-/* 상단 고정 — 탭바와 요약 바 */
+/* 상단 고정 — Streamlit 헤더를 불투명하게 만들고 그 아래에 탭바를 붙임 */
+header[data-testid="stHeader"]{ background:var(--paper) !important; height:2.8rem;
+  z-index:1000; border-bottom:1px solid var(--line); }
+[data-testid="stToolbar"]{ right:.6rem; top:.15rem; }
+[data-testid="stDecoration"]{ display:none; }
+
 .stTabs [data-baseweb="tab-list"]{
-  position:sticky; top:0; z-index:99; background:var(--paper);
-  padding-top:.35rem; box-shadow:0 6px 10px -8px rgba(20,20,20,.18); }
-.stickybar{ position:sticky; top:44px; z-index:98; background:var(--card);
+  position:sticky; top:2.8rem; z-index:999; background:var(--paper);
+  padding:.4rem .1rem 0; margin-top:-.2rem;
+  border-bottom:1px solid var(--line2);
+  overflow-x:auto; overflow-y:hidden; scrollbar-width:thin;
+  box-shadow:0 8px 12px -10px rgba(20,20,20,.28); }
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar{ height:5px; }
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar-thumb{
+  background:var(--line2); border-radius:3px; }
+.stTabs [data-baseweb="tab"]{ white-space:nowrap; }
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{ display:none; }
+
+.stickybar{ position:sticky; top:calc(2.8rem + 46px); z-index:998; background:var(--card);
   border:1px solid var(--line); border-radius:8px; padding:.55rem .9rem;
   margin:.2rem 0 1rem; display:flex; flex-wrap:wrap; align-items:center;
   gap:.55rem 1.15rem; box-shadow:0 2px 6px rgba(20,20,20,.06); }
@@ -254,6 +290,41 @@ NEG_WORDS = ["하향", "부진", "감소", "적자", "소송", "리콜", "제재
 # ════════════════════════════════════════════════════════════════════════════
 # 유틸
 # ════════════════════════════════════════════════════════════════════════════
+def bday(offset=0):
+    """오늘 기준 offset 영업일 (KRX 휴장일은 호출부에서 재시도)"""
+    d = datetime.today() - timedelta(days=offset)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def ymd(d):
+    return d.strftime("%Y%m%d")
+
+
+def krx_try(fn, *args, tries=6, **kwargs):
+    """휴장일/일시 오류를 감안해 날짜를 물리며 재시도. (결과, 사유) 반환"""
+    if not HAS_KRX or krx is None:
+        return None, "pykrx 미사용"
+    last = ""
+    for i in range(tries):
+        try:
+            r = fn(*args, **kwargs)
+            if r is not None and (not hasattr(r, "empty") or not r.empty):
+                return r, ""
+            last = "빈 응답"
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:60]}"
+        if args and isinstance(args[0], str) and len(args[0]) == 8 and args[0].isdigit():
+            d = datetime.strptime(args[0], "%Y%m%d") - timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+            args = (ymd(d),) + args[1:]
+        else:
+            break
+    return None, last
+
+
 def is_kr_code(t):
     t = str(t).strip()
     return t.isdigit() and len(t) == 6
@@ -370,12 +441,148 @@ def safe(v, d=None):
 # ════════════════════════════════════════════════════════════════════════════
 # 데이터 레이어
 # ════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def kr_universe():
+    """한국 상장 전종목: code -> {name, market, type}. 다중 소스 병합."""
+    rows, log = {}, []
+    if HAS_FDR:
+        for mk, typ in [("KRX", "주식"), ("ETF/KR", "ETF")]:
+            try:
+                d = fdr.StockListing(mk)
+                if d is None or d.empty:
+                    continue
+                cols = list(d.columns)
+                ccol = next((c for c in ("Code", "Symbol", "종목코드") if c in cols), cols[0])
+                ncol = next((c for c in ("Name", "종목명") if c in cols), cols[1])
+                mcol = next((c for c in ("Market", "시장") if c in cols), None)
+                n0 = 0
+                for _, r in d.iterrows():
+                    c = re.sub(r"\D", "", str(r[ccol]))[:6].zfill(6)
+                    if len(c) != 6 or c == "000000":
+                        continue
+                    nm = str(r[ncol]).strip()
+                    if not nm or nm == "nan":
+                        continue
+                    mkt = str(r[mcol]).upper() if mcol and str(r[mcol]) != "nan" else ""
+                    prev = rows.get(c)
+                    rows[c] = {"name": nm,
+                               "market": ("KOSDAQ" if "KOSDAQ" in mkt or "코스닥" in mkt
+                                          else ("KOSPI" if mkt or typ == "ETF"
+                                                else (prev or {}).get("market", "KOSPI"))),
+                               "type": typ if typ == "ETF" else (prev or {}).get("type", "주식")}
+                    n0 += 1
+                log.append((f"유니버스 {mk}", "성공", f"{n0:,}종목"))
+            except Exception as e:
+                log.append((f"유니버스 {mk}", "실패", f"{type(e).__name__}"))
+    if HAS_KRX:
+        d0 = ymd(bday())
+        for mk in ("KOSPI", "KOSDAQ"):
+            lst, why = krx_try(krx.get_market_ticker_list, d0, market=mk)
+            if lst:
+                added = 0
+                for c in lst:
+                    if c not in rows:
+                        try:
+                            nm = krx.get_market_ticker_name(c)
+                        except Exception:
+                            nm = c
+                        rows[c] = {"name": nm, "market": mk, "type": "주식"}
+                        added += 1
+                    else:
+                        rows[c]["market"] = mk
+                log.append((f"유니버스 {mk}(pykrx)", "성공", f"{len(lst):,}종목 · 신규 {added}"))
+            else:
+                log.append((f"유니버스 {mk}(pykrx)", "실패", why))
+        elst, why = krx_try(krx.get_etf_ticker_list, d0)
+        if elst:
+            for c in elst:
+                if c in rows:
+                    rows[c]["type"] = "ETF"
+                else:
+                    try:
+                        nm = krx.get_etf_ticker_name(c)
+                    except Exception:
+                        nm = c
+                    rows[c] = {"name": nm, "market": "KOSPI", "type": "ETF"}
+            log.append(("유니버스 ETF(pykrx)", "성공", f"{len(elst):,}종목"))
+        else:
+            log.append(("유니버스 ETF(pykrx)", "실패", why))
+    return rows, log
+
+
+def kr_name_search(q, limit=15):
+    """종목명 부분 일치 검색 → [(code, name, type, market)]"""
+    uni, _ = kr_universe()
+    if not uni:
+        return []
+    key = str(q).strip().lower().replace(" ", "")
+    if not key:
+        return []
+    exact, partial = [], []
+    for c, v in uni.items():
+        nm = v["name"].lower().replace(" ", "")
+        if nm == key:
+            exact.append((c, v["name"], v["type"], v["market"]))
+        elif key in nm:
+            partial.append((c, v["name"], v["type"], v["market"]))
+    partial.sort(key=lambda x: len(x[1]))
+    return (exact + partial)[:limit]
+
+
+def resolve_ticker(raw):
+    """입력을 실제 조회 가능한 코드로 해석.
+    반환 (code, market, note, candidates)"""
+    s = str(raw or "").strip()
+    if not s:
+        return None, None, "", []
+    up = s.upper().replace(" ", "")
+    digits_only = re.sub(r"[^0-9A-Z]", "", up)     # 한국 코드 매칭용 (하이픈 제거)
+
+    m = re.fullmatch(r"(\d{6})\.(KS|KQ|KRX)", up)
+    if m:
+        return m.group(1), "KR", "접미사 제거", []
+    if re.fullmatch(r"A\d{6}", digits_only):              # A005930 표기
+        return digits_only[1:], "KR", "A접두 제거", []
+    if re.fullmatch(r"\d{6}", digits_only):
+        return digits_only, "KR", "", []
+    if re.fullmatch(r"\d{1,5}", digits_only):
+        uni, _ = kr_universe()
+        cand = digits_only.zfill(6)
+        if cand in uni:
+            return cand, "KR", f"{digits_only} → {cand} 자릿수 보정", []
+    if re.search(r"[가-힣]", s):
+        c = kr_name_search(s)
+        if len(c) == 1:
+            return c[0][0], "KR", f"이름 검색 '{s}' → {c[0][1]}", []
+        if c:
+            return None, None, f"'{s}' 검색 결과 {len(c)}건 — 아래에서 고르세요", c
+        return None, None, f"'{s}' 검색 결과가 없습니다", []
+    # 6자리 혼합(오타) — 숫자 4자 이상이면 한국 코드 오타로 보고 와일드카드 매칭
+    if len(digits_only) == 6 and sum(ch.isdigit() for ch in digits_only) >= 4 \
+            and not digits_only.isalpha():
+        uni, _ = kr_universe()
+        if uni:
+            pat = re.compile("^" + "".join(ch if ch.isdigit() else "."
+                                           for ch in digits_only) + "$")
+            c = [(k, v["name"], v["type"], v["market"]) for k, v in uni.items() if pat.match(k)]
+            c.sort(key=lambda x: (x[2] != "ETF", x[1]))
+            if len(c) == 1:
+                return c[0][0], "KR", f"'{digits_only}' → {c[0][0]} 오타 보정", []
+            if c:
+                return None, None, (f"'{digits_only}'는 유효한 종목코드가 아닙니다 — "
+                                    "아래 후보에서 고르거나 종목명으로 검색하세요"), c[:15]
+    if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", up):
+        return up, "US", "", []
+    return None, None, f"'{s}'를 해석할 수 없습니다", []
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def load_price(ticker):
+def load_price(ticker, force_market=None):
     """상장 이후 전 구간 일봉. (df, market, name, log)"""
     t = str(ticker).strip().upper()
     log = []
-    if is_kr_code(t):
+    if force_market == "KR" or (force_market is None and is_kr_code(t)):
         df, src = None, ""
         if HAS_FDR:
             try:
@@ -393,16 +600,29 @@ def load_price(ticker):
                     df, src = naive(d), "pykrx"
             except Exception as e:
                 log.append(("일봉", "실패", f"pykrx: {type(e).__name__}"))
+        if df is None and HAS_YF:
+            for suf in (".KS", ".KQ"):
+                try:
+                    d = yf.Ticker(t + suf).history(period="max", auto_adjust=True)
+                    if d is not None and len(d) > 60:
+                        df, src = naive(d), f"yfinance({t}{suf})"
+                        break
+                except Exception as e:
+                    log.append(("일봉", "재시도", f"yfinance{suf}: {type(e).__name__}"))
         if df is None:
+            log.append(("일봉", "실패", "모든 소스 실패"))
             return None, "KR", t, log
-        name = t
-        if HAS_KRX:
-            try:
-                nm = krx.get_market_ticker_name(t)
-                if nm:
-                    name = f"{nm} ({t})"
-            except Exception:
-                pass
+        uni, _ = kr_universe()
+        nm = (uni.get(t) or {}).get("name")
+        if not nm and HAS_KRX:
+            for f in (krx.get_market_ticker_name, krx.get_etf_ticker_name):
+                try:
+                    nm = f(t)
+                    if nm:
+                        break
+                except Exception:
+                    continue
+        name = f"{nm} ({t})" if nm else t
         log.append(("일봉", "성공", f"{src} · {len(df):,}일 ({df.index[0]:%Y-%m-%d}~)"))
         return df, "KR", name, log
 
@@ -564,9 +784,11 @@ def load_kr_fund(ticker):
 
     if HAS_KRX:
         try:
-            end = datetime.today().strftime("%Y%m%d")
-            st0 = (datetime.today() - timedelta(days=20)).strftime("%Y%m%d")
-            f = krx.get_market_fundamental(st0, end, ticker)
+            end = ymd(bday())
+            st0 = ymd(bday(30))
+            f, why = krx_try(krx.get_market_fundamental, st0, end, ticker)
+            if f is None:
+                F["log"].append(("KR 밸류에이션", "실패", f"pykrx: {why}"))
             if f is not None and not f.empty:
                 F["per"] = F["per"] or safe(f["PER"].iloc[-1])
                 F["pbr"] = F["pbr"] or safe(f["PBR"].iloc[-1])
@@ -576,7 +798,7 @@ def load_kr_fund(ticker):
                     F["roe"] = F["eps_ttm"] / F["bps"] * 100
                 F["src"].append("pykrx(KRX 공시)")
                 F["log"].append(("KR 밸류에이션", "성공", "pykrx"))
-            cap = krx.get_market_cap(st0, end, ticker)
+            cap, _w = krx_try(krx.get_market_cap, st0, end, ticker)
             if cap is not None and not cap.empty:
                 F["mktcap"] = safe(cap["시가총액"].iloc[-1])
                 F["shares"] = safe(cap["상장주식수"].iloc[-1])
@@ -585,7 +807,7 @@ def load_kr_fund(ticker):
     return F
 
 
-def _us_tab(stmt):
+def _stmt_tab(stmt):
     """yfinance 손익계산서 → 지표×기간 테이블(한글 지표명)"""
     mp = {"Total Revenue": "매출액", "Operating Income": "영업이익",
           "Net Income": "순이익", "Diluted EPS": "EPS"}
@@ -668,7 +890,7 @@ def load_us_fund(ticker):
                     ("Total Revenue", "Operating Income", "Net Income", "Diluted EPS")]
             if keep:
                 F["table"] = q.loc[keep]
-                F["q_tab"] = _us_tab(q)
+                F["q_tab"] = _stmt_tab(q)
             F["src"].append("yfinance 분기 손익")
             F["log"].append(("US 분기실적", "성공", "quarterly_income_stmt"))
     except Exception as e:
@@ -683,9 +905,125 @@ def load_us_fund(ticker):
                 F["y_series"] = s
                 if len(s) >= 2:
                     F["y_eps"], F["y_eps_prev2"] = float(s.iloc[-1]), float(s.iloc[-2])
-            F["y_tab"] = _us_tab(a)
+            F["y_tab"] = _stmt_tab(a)
     except Exception:
         pass
+    return F
+
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_kr_fund_yf(ticker, seg=None):
+    """한국 종목을 yfinance(.KS/.KQ)로 조회해 재무 공백을 메움"""
+    out = {"log": [], "src": None}
+    if not HAS_YF:
+        out["log"].append(("KR 재무(yfinance)", "실패", "yfinance 미설치"))
+        return out
+    order = [".KS", ".KQ"] if seg != "KOSDAQ" else [".KQ", ".KS"]
+    for suf in order:
+        sym = f"{ticker}{suf}"
+        try:
+            tk = yf.Ticker(sym)
+            info = tk.info or {}
+            if not info or len(info) < 5:
+                continue
+            out["src"] = sym
+            out["per"] = safe(info.get("trailingPE"))
+            out["fper"] = safe(info.get("forwardPE"))
+            out["pbr"] = safe(info.get("priceToBook"))
+            out["psr"] = safe(info.get("priceToSalesTrailing12Months"))
+            out["peg"] = safe(info.get("trailingPegRatio")) or safe(info.get("pegRatio"))
+            out["mktcap"] = safe(info.get("marketCap"))
+            out["roe"] = (safe(info.get("returnOnEquity")) or 0) * 100 or None
+            out["opm"] = (safe(info.get("operatingMargins")) or 0) * 100 or None
+            out["npm"] = (safe(info.get("profitMargins")) or 0) * 100 or None
+            out["debt"] = safe(info.get("debtToEquity"))
+            out["shares"] = safe(info.get("sharesOutstanding"))
+            out["float"] = safe(info.get("floatShares"))
+            out["inst"] = (safe(info.get("heldPercentInstitutions")) or 0) * 100 or None
+            out["sector"], out["industry"] = info.get("sector"), info.get("industry")
+            out["div"] = (safe(info.get("dividendYield")) or 0) or None
+            if info.get("earningsQuarterlyGrowth") is not None:
+                out["q_growth_hint"] = safe(info["earningsQuarterlyGrowth"]) * 100
+            try:
+                q = tk.quarterly_income_stmt
+                if q is not None and not q.empty:
+                    q = q.iloc[:, ::-1]
+                    out["q_tab"] = _stmt_tab(q)
+                    er = [r for r in q.index if "Diluted EPS" in str(r)]
+                    if er:
+                        s = q.loc[er[0]].astype(float).dropna()
+                        out["q_series"] = s
+                        if len(s) >= 5:
+                            out["q_eps"], out["q_eps_prev"] = float(s.iloc[-1]), float(s.iloc[-5])
+                    rv = [r for r in q.index if str(r) == "Total Revenue"]
+                    if rv:
+                        s = q.loc[rv[0]].astype(float).dropna()
+                        if len(s) >= 5 and s.iloc[-5] > 0:
+                            out["q_sales"] = float(s.iloc[-1] / s.iloc[-5] - 1) * 100
+            except Exception:
+                pass
+            try:
+                a = tk.income_stmt
+                if a is not None and not a.empty:
+                    a = a.iloc[:, ::-1]
+                    out["y_tab"] = _stmt_tab(a)
+                    er = [r for r in a.index if "Diluted EPS" in str(r)]
+                    if er:
+                        s = a.loc[er[0]].astype(float).dropna()
+                        out["y_series"] = s
+                        if len(s) >= 2:
+                            out["y_eps"], out["y_eps_prev2"] = float(s.iloc[-1]), float(s.iloc[-2])
+            except Exception:
+                pass
+            out["log"].append(("KR 재무(yfinance)", "성공", f"{sym} · info+재무제표"))
+            return out
+        except Exception as e:
+            out["log"].append(("KR 재무(yfinance)", "재시도", f"{sym}: {type(e).__name__}"))
+            continue
+    out["log"].append(("KR 재무(yfinance)", "실패", "KS/KQ 모두 응답 없음"))
+    return out
+
+
+def merge_fund(base, extra):
+    """base에 없는 값만 extra로 채움 (로그·출처는 누적)"""
+    if not extra:
+        return base
+    for k, v in extra.items():
+        if k in ("log", "src"):
+            continue
+        cur = base.get(k)
+        empty = cur is None or (isinstance(cur, float) and np.isnan(cur)) or \
+            (isinstance(cur, pd.DataFrame) and cur.empty)
+        if empty and v is not None:
+            base[k] = v
+    base["log"] = list(base.get("log", [])) + list(extra.get("log", []))
+    if extra.get("src"):
+        base["src"] = list(base.get("src", [])) + [f'yfinance {extra["src"]}']
+    return base
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_kr_fund_all(ticker, seg=None):
+    """한국 종목 재무: 네이버 → pykrx → yfinance(.KS/.KQ) 순차 보완"""
+    F = load_kr_fund(ticker)
+    F = merge_fund(F, load_kr_fund_yf(ticker, seg))
+    # 표에서 EPS 성장 재계산 (직접 값이 비어 있을 때)
+    for tab_key, a_key, b_key, lag in [("q_tab", "q_eps", "q_eps_prev", 4),
+                                       ("y_tab", "y_eps", "y_eps_prev2", 1)]:
+        t = F.get(tab_key)
+        if F.get(a_key) is None and t is not None and not t.empty and "EPS" in t.index:
+            s = pd.to_numeric(t.loc["EPS"], errors="coerce").dropna()
+            if len(s) > lag:
+                F[a_key], F[b_key] = float(s.iloc[-1]), float(s.iloc[-1 - lag])
+            elif len(s) >= 2:
+                F[a_key], F[b_key] = float(s.iloc[-1]), float(s.iloc[-2])
+    if F.get("q_sales") is None and F.get("q_tab") is not None:
+        t = F["q_tab"]
+        if "매출액" in t.index:
+            s = pd.to_numeric(t.loc["매출액"], errors="coerce").dropna()
+            if len(s) > 4 and s.iloc[-5] > 0:
+                F["q_sales"] = float(s.iloc[-1] / s.iloc[-5] - 1) * 100
     return F
 
 
@@ -707,10 +1045,11 @@ def load_rs_universe(market):
         if market == "KR":
             if not HAS_KRX:
                 return None
-            today, base = datetime.today(), {}
+            base, end = {}, ymd(bday())
             for k, d in [("r3", 92), ("r6", 183), ("r9", 274), ("r12", 365)]:
-                ch = krx.get_market_price_change((today - timedelta(days=d)).strftime("%Y%m%d"),
-                                                 today.strftime("%Y%m%d"), market="ALL")
+                ch, _w = krx_try(krx.get_market_price_change, ymd(bday(d)), end, market="ALL")
+                if ch is None or "등락률" not in ch.columns:
+                    return None
                 base[k] = ch["등락률"]
             return pd.DataFrame(base).dropna()
         if not HAS_YF:
@@ -2252,15 +2591,17 @@ def detect_etf(ticker, market, name=""):
     info = {"is_etf": False, "kind": None, "expense": None, "aum": None,
             "cat": None, "yield_": None, "log": []}
     if market == "KR":
-        if HAS_KRX:
-            try:
-                etfs = krx.get_etf_ticker_list(datetime.today().strftime("%Y%m%d"))
-                if ticker in set(etfs):
-                    info["is_etf"] = True
-                    info["kind"] = "ETF"
-                    info["log"].append(("ETF 판별", "성공", "KRX ETF 목록 일치"))
-            except Exception as e:
-                info["log"].append(("ETF 판별", "실패", type(e).__name__))
+        uni, _ = kr_universe()
+        if (uni.get(ticker) or {}).get("type") == "ETF":
+            info.update({"is_etf": True, "kind": "ETF"})
+            info["log"].append(("ETF 판별", "성공", "국내 유니버스(ETF 목록) 일치"))
+        if not info["is_etf"] and HAS_KRX:
+            etfs, why = krx_try(krx.get_etf_ticker_list, ymd(bday()))
+            if etfs and ticker in set(etfs):
+                info.update({"is_etf": True, "kind": "ETF"})
+                info["log"].append(("ETF 판별", "성공", "KRX ETF 목록 일치"))
+            elif etfs is None:
+                info["log"].append(("ETF 판별", "부분", f"pykrx: {why} — 명칭으로 추정"))
         if not info["is_etf"] and name:
             up = name.upper()
             if any(h.upper() in up for h in KR_ETF_HINT):
@@ -2289,8 +2630,8 @@ def load_etf_holdings(ticker, market):
     """ETF 구성종목 + 비중"""
     out = {"df": None, "src": None, "log": [], "asof": None}
     if market == "KR" and HAS_KRX:
-        for back in range(0, 8):
-            d = (datetime.today() - timedelta(days=back)).strftime("%Y%m%d")
+        for back in range(0, 12):
+            d = ymd(bday(back))
             try:
                 pdf = krx.get_etf_portfolio_deposit_file(d, ticker)
                 if pdf is not None and not pdf.empty:
@@ -2431,34 +2772,26 @@ def load_kr_supply(ticker, days=120):
     if not HAS_KRX:
         out["log"].append(("KR 수급", "실패", "pykrx 미설치"))
         return out
-    end = datetime.today().strftime("%Y%m%d")
-    st0 = (datetime.today() - timedelta(days=int(days * 1.8))).strftime("%Y%m%d")
-    try:
-        v = krx.get_market_trading_value_by_date(st0, end, ticker)
-        if v is not None and not v.empty:
-            out["value"] = v.tail(days)
-            out["log"].append(("수급 금액", "성공", f"pykrx · {len(out['value'])}일"))
-    except Exception as e:
-        out["log"].append(("수급 금액", "실패", type(e).__name__))
-    try:
-        q = krx.get_market_trading_volume_by_date(st0, end, ticker)
-        if q is not None and not q.empty:
-            out["volume"] = q.tail(days)
-    except Exception:
-        pass
-    try:
-        h = krx.get_exhaustion_rates_of_foreign_investment(st0, end, ticker)
-        if h is not None and not h.empty:
-            out["hold"] = h.tail(days)
-            out["log"].append(("외국인 보유비중", "성공", "pykrx 소진율"))
-    except Exception as e:
-        out["log"].append(("외국인 보유비중", "실패", type(e).__name__))
-    try:
-        s = krx.get_shorting_balance_by_date(st0, end, ticker)
-        if s is not None and not s.empty:
-            out["short"] = s.tail(days)
-    except Exception:
-        pass
+    end = ymd(bday())
+    st0 = ymd(bday(int(days * 1.8)))
+    v, why = krx_try(krx.get_market_trading_value_by_date, st0, end, ticker)
+    if v is not None:
+        out["value"] = v.tail(days)
+        out["log"].append(("수급 금액", "성공", f"pykrx · {len(out['value'])}일"))
+    else:
+        out["log"].append(("수급 금액", "실패", f"pykrx: {why}"))
+    q, _w = krx_try(krx.get_market_trading_volume_by_date, st0, end, ticker)
+    if q is not None:
+        out["volume"] = q.tail(days)
+    h, why2 = krx_try(krx.get_exhaustion_rates_of_foreign_investment, st0, end, ticker)
+    if h is not None:
+        out["hold"] = h.tail(days)
+        out["log"].append(("외국인 지분율", "성공", f"pykrx · {len(out['hold'])}일"))
+    else:
+        out["log"].append(("외국인 지분율", "실패", f"pykrx: {why2}"))
+    s, _w2 = krx_try(krx.get_shorting_balance_by_date, st0, end, ticker)
+    if s is not None:
+        out["short"] = s.tail(days)
     return out
 
 
@@ -2762,19 +3095,66 @@ with st.sidebar:
     if "tk_input" not in st.session_state:
         st.session_state["tk_input"] = load_json_file(LAST_FILE, {}).get("ticker", "NVDA")
 
-    def _on_ticker_change():
-        v = str(st.session_state.get("tk_input", "")).strip().upper()
-        if v:
-            st.session_state["tk_active"] = v
+    def _apply_ticker():
+        raw = str(st.session_state.get("tk_input", "")).strip()
+        if not raw:
+            return
+        code, mkt, note, cands = resolve_ticker(raw)
+        st.session_state["tk_note"] = note
+        st.session_state["tk_cands"] = cands
+        if code:
+            st.session_state["tk_active"] = code
+            st.session_state["tk_market"] = mkt
 
-    st.text_input("종목코드 / 티커", key="tk_input", on_change=_on_ticker_change,
-                  help="한국 6자리 숫자(005930) · 해외 티커(NVDA) — 입력 후 Enter")
+    st.text_input("종목코드 · 티커 · 종목명", key="tk_input", on_change=_apply_ticker,
+                  help="한국 6자리(005930) · 해외 티커(NVDA) · 한글 종목명(삼성전자) 모두 가능")
     if st.button("조회", use_container_width=True, type="primary"):
-        _on_ticker_change()
+        _apply_ticker()
+
     if "tk_active" not in st.session_state:
-        st.session_state["tk_active"] = str(st.session_state["tk_input"]).strip().upper()
+        _c, _m, _n, _cd = resolve_ticker(st.session_state["tk_input"])
+        st.session_state["tk_active"] = _c or "NVDA"
+        st.session_state["tk_market"] = _m or "US"
+        st.session_state["tk_note"] = _n
+        st.session_state["tk_cands"] = _cd
+
+    cands = st.session_state.get("tk_cands") or []
+    if cands:
+        st.warning(st.session_state.get("tk_note") or "여러 종목이 검색되었습니다.")
+        opts = [f'{c} · {n} ({t})' for c, n, t, _m2 in cands]
+        pick = st.selectbox("후보에서 선택", opts, index=None, placeholder="종목을 고르세요")
+        if pick:
+            st.session_state["tk_active"] = pick.split(" · ")[0]
+            st.session_state["tk_market"] = "KR"
+            st.session_state["tk_cands"] = []
+            st.session_state["tk_note"] = ""
+            st.rerun()
+    elif st.session_state.get("tk_note"):
+        st.caption("↳ " + st.session_state["tk_note"])
+
     ticker_in = st.session_state["tk_active"]
-    st.caption(f"현재 분석 중 · {ticker_in}   (입력 후 Enter 또는 조회 버튼)")
+    forced_market = st.session_state.get("tk_market")
+    _uni, _unilog = kr_universe()
+    _meta = _uni.get(ticker_in) if forced_market == "KR" else None
+    st.caption(f'현재 분석 중 · **{ticker_in}**'
+               + (f' · {_meta["name"]} ({_meta["type"]})' if _meta else ''))
+
+    with st.expander("종목명으로 찾기 (한국)"):
+        kw = st.text_input("검색어", value="", key="kw_search",
+                           placeholder="예: 화장품, 반도체, 삼성")
+        if kw:
+            hits = kr_name_search(kw, 20)
+            if hits:
+                for c, n, t, m2 in hits:
+                    if st.button(f'{c} · {n} · {t}', key=f'sr_{c}',
+                                 use_container_width=True):
+                        st.session_state["tk_active"] = c
+                        st.session_state["tk_market"] = "KR"
+                        st.session_state["tk_input"] = c
+                        st.session_state["tk_cands"] = []
+                        st.rerun()
+            else:
+                st.caption("검색 결과가 없습니다. 국내 유니버스 수집 상태를 확인하세요.")
     st.markdown("---")
     capital = st.number_input("투자 가능 금액", min_value=0, value=0, step=1000000,
                               help="0이면 수량 계산을 생략합니다")
@@ -2787,12 +3167,32 @@ with st.sidebar:
     use_weekly = st.checkbox("차트 주봉 보기", value=True)
     st.markdown("---")
     st.markdown(f'<div class="hint mono">FDR {"OK" if HAS_FDR else "X"} · '
-                f'YF {"OK" if HAS_YF else "X"} · KRX {"OK" if HAS_KRX else "X"}<br>'
-                f'{datetime.now():%Y-%m-%d %H:%M} 기준</div>', unsafe_allow_html=True)
+                f'YF {"OK" if HAS_YF else "X"} · KRX {"OK" if HAS_KRX else "X"} · '
+                f'국내 유니버스 {len(_uni):,}종목<br>{datetime.now():%Y-%m-%d %H:%M} 기준</div>',
+                unsafe_allow_html=True)
+    if KRX_NOTE:
+        st.caption("KRX · " + KRX_NOTE)
+    with st.expander("데이터 소스 진단"):
+        st.markdown(table(["항목", "상태", "내용"],
+                          [[a, tag(b_, "pass" if b_ == "성공" else
+                                   ("warn" if b_ in ("부분", "재시도") else "fail")), c_]
+                           for a, b_, c_ in _unilog]) if _unilog else
+                    '<div class="hint">유니버스 로그 없음</div>', unsafe_allow_html=True)
+        st.caption("국내 유니버스가 0종목이면 종목명 검색·오타 보정·ETF 판별이 동작하지 않습니다. "
+                   "이 경우 6자리 코드를 정확히 입력하세요.")
 
 TK = ticker_in.strip().upper()
+st.markdown('<div id="top"></div>', unsafe_allow_html=True)
 TABS = st.tabs(["  대시보드  ", "  시장  ", "  환율  ", "  개별종목  ", "  차트스쿨  ",
                 "  분석보강  ", "  뉴스  ", "  종목스캔  ", "  my투자  ", "  사용 가이드  "])
+
+
+def to_top():
+    st.markdown('<div style="text-align:right;margin:1.2rem 0 .3rem">'
+                '<a href="#top" style="font-family:IBM Plex Mono,monospace;font-size:.72rem;'
+                'color:#7A828B;text-decoration:none;border:1px solid #E2DED5;border-radius:6px;'
+                'padding:.3rem .7rem;background:#FFFFFF">↑ 맨 위로 (탭 이동)</a></div>',
+                unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2803,6 +3203,9 @@ def kr_segment(ticker):
     """한국 종목의 소속 시장 (KOSPI / KOSDAQ)"""
     if not is_kr_code(ticker):
         return None
+    uni, _ = kr_universe()
+    if ticker in uni:
+        return uni[ticker].get("market") or "KOSPI"
     if HAS_KRX:
         try:
             d = datetime.today().strftime("%Y%m%d")
@@ -2826,11 +3229,11 @@ def kr_segment(ticker):
     return "KOSPI"
 
 
-def build_context(tk):
+def build_context(tk, force_market=None):
     ctx = {"ok": False, "log": []}
     if not tk:
         return ctx
-    dfd, market, name, log = load_price(tk)
+    dfd, market, name, log = load_price(tk, force_market)
     if dfd is None or len(dfd) < 120:
         ctx["log"] = log
         ctx["name"] = tk
@@ -2838,7 +3241,8 @@ def build_context(tk):
     dfd = dfd[~dfd.index.duplicated(keep="last")].sort_index()
     idxs, ilog = load_indices(market)
     etfinfo = detect_etf(tk, market, name)
-    fnd = load_kr_fund(tk) if market == "KR" else load_us_fund(tk)
+    seg0 = kr_segment(tk) if market == "KR" else None
+    fnd = load_kr_fund_all(tk, seg0) if market == "KR" else load_us_fund(tk)
     states = {nm: index_state(idf, min_gain, corr_pct) for nm, idf in idxs.items()}
     uni = load_rs_universe(market)
     bw = buy_window(states, breadth_pct(uni)) if states else None
@@ -2851,8 +3255,7 @@ def build_context(tk):
     # 벤치마크: 한국은 소속 시장(코스피/코스닥) 지수를 기준으로 RS 라인/베타 산출
     bench_nm, bench = lead_nm, lead
     if market == "KR":
-        seg = kr_segment(tk)
-        want = "코스닥" if seg == "KOSDAQ" else "코스피"
+        want = "코스닥" if seg0 == "KOSDAQ" else "코스피"
         if want in states:
             bench_nm, bench = want, states[want]["df"]
     rating, r = rs_rating(dfd, uni)
@@ -2862,7 +3265,7 @@ def build_context(tk):
                 "fnd": fnd, "binfo": binfo, "ma": ma, "ma_ok": ma_ok, "up200": up200,
                 "rating": rating, "rets": r, "rsl": rsl, "rs_new": rs_new, "uni": uni,
                 "bench": bench, "bench_nm": bench_nm,
-                "etf": etfinfo, "seg": kr_segment(tk) if market == "KR" else None,
+                "etf": etfinfo, "seg": seg0,
                 "price": float(dfd["Close"].iloc[-1])})
     return ctx
 
@@ -2900,7 +3303,7 @@ def sticky_bar(ctx, D, extra=""):
     st.markdown('<div class="stickybar">' + "".join(parts) + '</div>', unsafe_allow_html=True)
 
 
-CTX = build_context(TK)
+CTX = build_context(TK, forced_market)
 
 if CTX.get("ok") and TK:
     save_json_file(LAST_FILE, {"ticker": TK, "at": datetime.now().isoformat(timespec="seconds")})
@@ -2928,22 +3331,13 @@ def derive(ctx, q_over=None, y_over=None):
     s_ok = ad_ratio >= 1.0
     l_ok = ctx["rating"] is not None and ctx["rating"] >= 80
     if ctx["market"] == "KR":
-        flow = load_kr_flow(TK)
-        i_ok = False
-        fo20 = in20 = None
-        if flow is not None and not flow.empty:
-            def gc(*ks):
-                for k in ks:
-                    if k in flow.columns:
-                        return flow[k]
-                return None
-            fo, ins = gc("외국인합계", "외국인"), gc("기관합계", "기관")
-            fo20 = float(fo.tail(20).sum()) / 1e8 if fo is not None else None
-            in20 = float(ins.tail(20).sum()) / 1e8 if ins is not None else None
-            i_ok = (fo20 or 0) > 0 or (in20 or 0) > 0
+        SUPD = supply_summary(load_kr_supply(TK))
+        if SUPD:
+            i_ok = SUPD["score"] >= 50
+            flowinfo = {"sup": SUPD}
         else:
             i_ok = ad_ratio >= 1.3
-        flowinfo = {"flow": flow, "fo20": fo20, "in20": in20}
+            flowinfo = {"sup": None}
     else:
         inst = fnd.get("inst")
         i_ok = inst is not None and 15 <= inst <= 90
@@ -3093,6 +3487,7 @@ with TABS[0]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — 시장
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[1]:
     if not CTX.get("ok") or not CTX["states"]:
         st.warning("지수 데이터를 불러오지 못했습니다.")
@@ -3203,6 +3598,7 @@ with TABS[1]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 3 — 개별종목
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[3]:
     if not CTX.get("ok"):
         st.error("종목 데이터를 불러오지 못했습니다.")
@@ -3559,6 +3955,22 @@ with TABS[3]:
                 ("분기 매출 증가율", pct(D["q_sales"]), "+25% 이상", (D["q_sales"] or 0) >= 25),
                 ("ROE", pct(D["roe"], 1, False), "17% 이상", (D["roe"] or 0) >= 17)]),
                 unsafe_allow_html=True)
+            _srcs = fnd.get("src") or []
+            if _srcs:
+                st.markdown('<div class="ev">재무 데이터 출처 · <b>'
+                            + " → ".join(str(x) for x in _srcs) + '</b></div>',
+                            unsafe_allow_html=True)
+            _miss = [k for k, lab in [("q_eps", "분기 EPS"), ("y_eps", "연간 EPS"),
+                                      ("roe", "ROE"), ("opm", "영업이익률"),
+                                      ("debt", "부채비율"), ("per", "PER")]
+                     if fnd.get(k) is None]
+            if _miss:
+                st.markdown('<div class="hint">' + tag("일부 항목 미수집", "warn")
+                            + ' 아래 항목이 비어 있습니다 — '
+                            + ", ".join(_miss)
+                            + '. 위 입력란에 공시 수치를 넣으면 판정에 즉시 반영됩니다. '
+                              '한국 종목은 네이버 → pykrx → yfinance(.KS/.KQ) 순으로 시도합니다.</div>',
+                            unsafe_allow_html=True)
             if fnd.get("table") is not None:
                 with st.expander("원본 실적표"):
                     st.dataframe(fnd["table"], use_container_width=True)
@@ -3643,7 +4055,7 @@ with TABS[3]:
 
         SUP = None
         if market == "KR":
-            SUP = supply_summary(load_kr_supply(TK))
+            SUP = D["flowinfo"].get("sup")
             if SUP:
                 fo = SUP["flow"].get("외국인", {})
                 ins = SUP["flow"].get("기관", {})
@@ -3719,10 +4131,18 @@ with TABS[3]:
                     if sv is not None:
                         st.dataframe(sv.tail(30).iloc[::-1], use_container_width=True)
             else:
+                _slog = load_kr_supply(TK)["log"]
+                _why = " · ".join(x[2] for x in _slog if x[1] == "실패") or "pykrx 응답 없음"
                 c[2].markdown(card("기관/외국인", "수집 실패",
-                                   "pykrx 응답 없음 · A/D 등급으로 대체", "mut"), unsafe_allow_html=True)
-                c[3].markdown(card("대체 판정", D["ad_grade"], "거래량 패턴 기반"),
+                                   f'{_why}<br>A/D 등급으로 대체 판정', "mut"), unsafe_allow_html=True)
+                c[3].markdown(card("대체 판정", D["ad_grade"],
+                                   f'매집 {D["up_n"]}일 vs 분산 {D["dn_n"]}일 (거래량 패턴)'),
                               unsafe_allow_html=True)
+                st.markdown('<div class="hint">KRX 수급 API가 응답하지 않습니다. '
+                            'Streamlit Cloud 등 해외 서버에서는 KRX 접속이 차단될 수 있습니다. '
+                            '로컬에서 실행하면 대부분 정상 수집됩니다. '
+                            '거래량 기반 A/D 등급은 그대로 유효합니다.</div>',
+                            unsafe_allow_html=True)
         else:
             c[2].markdown(card("기관 보유 비중", pct(fnd.get("inst"), 1, False), "15~90% 적정",
                                "up" if D["i_ok"] else "mut"), unsafe_allow_html=True)
@@ -3878,6 +4298,7 @@ with TABS[3]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 2 — 환율
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[2]:
     if CTX.get("ok"):
         sticky_bar(CTX, D)
@@ -3968,6 +4389,7 @@ with TABS[2]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 5 — 뉴스
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[6]:
     if CTX.get("ok"):
         sticky_bar(CTX, D)
@@ -4022,6 +4444,7 @@ with TABS[6]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 6 — 종목 스캔
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[7]:
     st.markdown('<div class="masthead"><h1>종목 스캔</h1><div class="sub">'
                 '추가한 종목이 목록에 계속 남습니다</div></div>', unsafe_allow_html=True)
@@ -4054,10 +4477,14 @@ with TABS[7]:
         tks = load_watchlist()
         bar_ = st.progress(0.0, text="준비 중…")
         rows, ucache = [], {}
-        for i, t in enumerate(tks, 1):
-            bar_.progress(i / len(tks), text=f"{t} ({i}/{len(tks)})")
+        for i, t0 in enumerate(tks, 1):
+            bar_.progress(i / len(tks), text=f"{t0} ({i}/{len(tks)})")
+            t, fm, _n2, _c2 = resolve_ticker(t0)
+            if not t:
+                rows.append({"종목": t0, "상태": "코드 해석 실패"})
+                continue
             try:
-                d, mk, nm, _ = load_price(t)
+                d, mk, nm, _ = load_price(t, fm)
                 if d is None or len(d) < 200:
                     rows.append({"종목": t, "상태": "데이터 없음"})
                     continue
@@ -4098,6 +4525,7 @@ with TABS[7]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 4 — 분석보강 (기본 분석에서 빠지기 쉬운 항목)
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[5]:
     st.markdown('<div class="masthead"><h1>분석보강</h1><div class="sub">'
                 'CANSLIM 본체에는 없지만 실패를 줄이는 항목들</div></div>', unsafe_allow_html=True)
@@ -4233,6 +4661,54 @@ with TABS[5]:
                              "지수만 오르고 이 값이 낮으면 소수 종목 장세",
                              "up" if br >= 50 else "down"), unsafe_allow_html=True)
 
+
+        step_header("SOURCE", "데이터 소스 실시간 진단", "무엇이 되고 무엇이 안 되는지 직접 확인")
+        if st.button("지금 전체 소스 점검", key="srccheck"):
+            res = []
+            t0 = TK
+            res.append(("입력 해석", "성공",
+                        f'{t0} → 시장 {market} · '
+                        + ("ETF" if CTX.get("etf", {}).get("is_etf") else "주식")
+                        + (f' · {CTX.get("seg")}' if CTX.get("seg") else "")))
+            uni_, unilog_ = kr_universe()
+            res += unilog_
+            res.append(("국내 유니버스", "성공" if uni_ else "실패",
+                        f'{len(uni_):,}종목 적재'))
+            res += [x for x in CTX.get("log", [])]
+            if market == "KR":
+                sup_ = load_kr_supply(t0)
+                res += sup_["log"]
+                fnd_ = CTX["fnd"]
+                res += [x for x in fnd_.get("log", [])]
+                got = {k: fnd_.get(k) for k in
+                       ("per", "pbr", "roe", "opm", "debt", "q_eps", "y_eps", "mktcap")}
+                filled = sum(1 for v in got.values() if v is not None)
+                res.append(("재무 항목 충족도",
+                            "성공" if filled >= 6 else ("부분" if filled >= 3 else "실패"),
+                            f'{filled}/8 항목 수집 · 비어있음: '
+                            + (", ".join(k for k, v in got.items() if v is None) or "없음")))
+                if CTX.get("etf", {}).get("is_etf"):
+                    h_ = load_etf_holdings(t0, market)
+                    res += h_["log"]
+            else:
+                res += [x for x in CTX["fnd"].get("log", [])]
+            nw_ = load_news(t0, market)[1]
+            res += nw_
+            st.markdown(table(["항목", "상태", "내용"],
+                              [[a, tag(b_, "pass" if b_ == "성공" else
+                                       ("warn" if b_ in ("부분", "재시도") else "fail")), c_]
+                               for a, b_, c_ in res]), unsafe_allow_html=True)
+            read_box(
+                '<b>KRX 관련 항목이 모두 실패</b>한다면 서버에서 KRX 접속이 막힌 것입니다. '
+                'Streamlit Cloud는 해외 서버라 KRX·네이버가 차단되는 경우가 있습니다. '
+                '이때는 ① 로컬(내 PC)에서 실행하거나, ② yfinance(.KS/.KQ) 경로로 자동 대체된 '
+                '재무 수치를 쓰시면 됩니다. 수급(외국인·기관)만은 KRX 전용이라 대체가 없어, '
+                '거래량 기반 A/D 등급으로 판정합니다.<br><br>'
+                '<b>KRX 계정을 넣으면</b> 일부 조회가 안정화됩니다. Streamlit Cloud의 '
+                'Settings → Secrets에 <span class="mono">KRX_ID</span>, '
+                '<span class="mono">KRX_PW</span>를 넣으면 앱이 자동으로 인증 세션을 씁니다 '
+                '(선택 사항이며, 없어도 대부분 동작합니다).', "진단 결과 읽는 법")
+
         step_header("CHECKLIST", "매수 전 최종 점검", "전부 통과해야 오닐 기준 매수")
         rows = final_checklist(D["m_ok"], D["c_ok"], D["a_ok"], D["n_ok"], D["s_ok"],
                                D["l_ok"], D["i_ok"], D["base_ok"], CTX["binfo"], D["sp"], diag)
@@ -4261,6 +4737,7 @@ with TABS[5]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 8 — 사용 가이드
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[9]:
     st.markdown('<div class="masthead"><h1>사용 가이드</h1><div class="sub">'
                 '오닐 기법과 이 앱을 함께 읽는 법</div></div>', unsafe_allow_html=True)
@@ -4341,6 +4818,22 @@ STEP 3 실적(3분기·3년) 순서로 보고, 하나라도 탈락이면 거기�
   ETF라도 개별 종목처럼 움직입니다.
 - **외국인 지분율** — 순매수 금액보다 정확한 매집 지표입니다. 금액은 단기 트레이딩일 수 있지만
   지분율이 꾸준히 오르면 실제로 물량을 쌓고 있다는 뜻입니다.
+
+**종목 입력 요령**
+
+- 한국: 6자리 코드(`005930`), 자릿수가 모자라도 자동 보정(`5930`), `.KS`/`A` 접두도 인식
+- 오타가 섞이면(`0008t0`) 비슷한 코드 후보를 띄워줍니다
+- **한글 종목명으로도 찾습니다** — `삼성전자`, `화장품`, `반도체`처럼 입력하면 후보가 나옵니다
+- 사이드바의 "종목명으로 찾기"에서 검색해 버튼으로 바로 선택할 수 있습니다
+- 해외: 티커 그대로(`NVDA`, `BRK-B`)
+
+**한국 종목 재무가 비어 있을 때**
+
+이 앱은 네이버 → pykrx → **yfinance(.KS/.KQ)** 순으로 자동 시도합니다.
+해외 서버(Streamlit Cloud)에서는 네이버·KRX가 차단될 수 있는데, 그때 yfinance 경로가
+ROE·영업이익률·부채비율·분기 손익계산서를 대신 채웁니다.
+그래도 비면 STEP 3의 직접 입력란에 공시 수치를 넣으면 즉시 판정에 반영됩니다.
+어떤 소스가 성공했는지는 **분석보강 탭 → 데이터 소스 실시간 진단**에서 확인하세요.
 """)
 
     step_header("RULES", "자동 판정 규칙 대조표")
@@ -4369,7 +4862,9 @@ STEP 3 실적(3분기·3년) 순서로 보고, 하나라도 탈락이면 거기�
 | R 배수 | 수익률 ÷ 8% (1R = 손절폭) | 손실 1R, 이익 3R 이상 |
 | RS 라인 기준지수 | 한국은 소속 시장(코스피/코스닥) 지수, 미국은 시장 국면이 가장 좋은 지수 | 해당 시장 지수 |
 | 한국 수급 | 외국인·기관·개인 5/20/60일 순매수 + 외국인 지분율 변화 + 공매도 잔고 | 기관 매집 확인 |
-| ETF 분석 | 구성종목 비중 가중 재무(look-through) + HHI 집중도 | 오닐 원전에 없음 |
+| ETF 분석 | 구성종목 비중 가중 재무(look-through) + 실효 종목수 | 오닐 원전에 없음 |
+| 한국 재무 보강 | 네이버 → pykrx → yfinance(.KS/.KQ) 순차 병합, 빈 항목만 채움 | — |
+| 종목 해석 | 6자리 코드 · 자릿수 보정 · 오타 와일드카드 · 한글명 검색 | — |
 """)
 
     step_header("MISTAKE", "가장 흔한 실수 5가지")
@@ -4394,6 +4889,7 @@ STEP 3 실적(3분기·3년) 순서로 보고, 하나라도 탈락이면 거기�
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 7 — my투자
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[8]:
     st.markdown('<div class="masthead"><h1>my투자</h1><div class="sub">'
                 '보유 종목 오늘의 전략 · 누적 수익률 관리</div></div>', unsafe_allow_html=True)
@@ -4587,6 +5083,7 @@ with TABS[8]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 4 — 차트스쿨
 # ════════════════════════════════════════════════════════════════════════════
+    to_top()
 with TABS[4]:
     if not CTX.get("ok"):
         st.info("종목을 먼저 입력하세요.")
@@ -4788,4 +5285,6 @@ with TABS[4]:
                     '한 종목씩 패턴을 확인하고 문제를 풀다 보면, 나중엔 차트를 열자마자 '
                     '모양이 보이게 됩니다. 오닐도 "수천 개의 차트를 직접 그려봤다"고 했습니다.</div>',
                     unsafe_allow_html=True)
+    to_top()
+
 
