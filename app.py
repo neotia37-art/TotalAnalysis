@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANSLIM TERMINAL  v8.0
+CANSLIM TERMINAL  v9.0
 윌리엄 오닐(William J. O'Neil) 기법 통합 투자 참고 터미널
 
 구성
@@ -442,92 +442,247 @@ def safe(v, d=None):
 # 데이터 레이어
 # ════════════════════════════════════════════════════════════════════════════
 
+CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
+
+
+def _pick_code_col(d):
+    """코드 컬럼을 '값의 모양'으로 검증해서 고른다. 못 찾으면 None."""
+    best, best_score = None, 0.0
+    prefer = ("CODE", "SYMBOL", "종목코드", "단축코드", "ISU_SRT_CD")
+    for c in d.columns:
+        try:
+            v = d[c].astype(str).str.strip().str.upper()
+        except Exception:
+            continue
+        v = v.str.replace(r"^A(?=[0-9A-Z]{6}$)", "", regex=True)
+        ok = v.str.fullmatch(r"[0-9A-Z]{6}")
+        score = float(ok.mean()) if len(ok) else 0.0
+        if score < 0.8:
+            continue
+        # 전부 숫자만인 컬럼이 순번(1,2,3…)일 가능성 배제: 6자리 문자열이어야 함
+        if v.str.len().mean() < 5.5:
+            continue
+        if str(c).upper() in prefer:
+            score += 0.5
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def _pick_name_col(d, code_col):
+    prefer = ("NAME", "종목명", "한글종목명", "ITEMNAME", "KOR_NM")
+    for p in prefer:
+        for c in d.columns:
+            if str(c).upper() == p:
+                return c
+    for c in d.columns:
+        if c == code_col:
+            continue
+        try:
+            v = d[c].astype(str)
+        except Exception:
+            continue
+        if v.str.contains(r"[가-힣A-Za-z]", regex=True).mean() > 0.8 and \
+                v.str.len().mean() > 2:
+            return c
+    return None
+
+
 @st.cache_data(ttl=43200, show_spinner=False)
 def kr_universe():
-    """한국 상장 전종목: code -> {name, market, type}. 다중 소스 병합."""
+    """한국 상장 전종목: code -> {name, market, type}.
+
+    안전 규칙
+      · 코드 컬럼은 값의 모양(6자리 영숫자)으로 검증해서 고른다 — 못 고르면 그 목록은 버린다
+      · 상장목록의 코드는 zfill 하지 않는다 (순번 컬럼이 가짜 코드로 둔갑하는 사고 방지)
+      · 먼저 적재된 이름을 나중 소스가 덮어쓰지 않는다 (유형·시장만 보강)
+    """
     rows, log = {}, []
+
+    def put(code, name, market, typ, src, close=None):
+        if not CODE_RE.match(code or ""):
+            return False
+        cur = rows.get(code)
+        if cur is None:
+            rows[code] = {"name": name, "market": market, "type": typ,
+                          "src": src, "close": close}
+            return True
+        if cur.get("close") is None and close is not None:
+            cur["close"] = close
+        if typ in ("ETF", "ETN") and cur.get("type") not in ("ETF", "ETN"):
+            cur["type"] = typ                      # 유형만 보강
+        if market and not cur.get("market"):
+            cur["market"] = market
+        return False
+
     if HAS_FDR:
         for mk, typ in [("KRX", "주식"), ("KRX-DESC", "주식"), ("ETF/KR", "ETF")]:
             try:
                 d = fdr.StockListing(mk)
                 if d is None or d.empty:
+                    log.append((f"유니버스 {mk}", "실패", "빈 응답"))
                     continue
-                cols = list(d.columns)
-                ccol = next((c for c in ("Code", "Symbol", "종목코드") if c in cols), cols[0])
-                ncol = next((c for c in ("Name", "종목명") if c in cols), cols[1])
-                mcol = next((c for c in ("Market", "시장") if c in cols), None)
+                d = d.reset_index()               # Code가 인덱스로 빠진 경우 복구
+                ccol = _pick_code_col(d)
+                if ccol is None:
+                    log.append((f"유니버스 {mk}", "실패",
+                                "코드 형태의 컬럼 없음 → 이 목록은 사용하지 않음 "
+                                f"(컬럼: {', '.join(map(str, list(d.columns)[:8]))})"))
+                    continue
+                ncol = _pick_name_col(d, ccol)
+                if ncol is None:
+                    log.append((f"유니버스 {mk}", "실패", "종목명 컬럼 없음"))
+                    continue
+                mcol = next((c for c in d.columns
+                             if str(c) in ("Market", "시장", "MarketId")), None)
+                pcol = next((c for c in d.columns
+                             if str(c) in ("Close", "Price", "종가", "현재가")), None)
                 n0 = 0
                 for _, r in d.iterrows():
-                    raw_c = str(r[ccol]).strip().upper()
-                    raw_c = re.sub(r"^A(?=[0-9A-Z]{6}$)", "", raw_c)
-                    c = re.sub(r"[^0-9A-Z]", "", raw_c)
-                    if len(c) < 6:
-                        c = c.zfill(6)
-                    c = c[:6]
-                    if len(c) != 6 or c == "000000" or not re.search(r"\d", c):
-                        continue
+                    c = re.sub(r"[^0-9A-Z]", "",
+                               re.sub(r"^A(?=[0-9A-Z]{6}$)", "",
+                                      str(r[ccol]).strip().upper()))
                     nm = str(r[ncol]).strip()
-                    if not nm or nm == "nan":
+                    if not CODE_RE.match(c) or not nm or nm.lower() == "nan":
                         continue
-                    mkt = str(r[mcol]).upper() if mcol and str(r[mcol]) != "nan" else ""
-                    prev = rows.get(c)
-                    rows[c] = {"name": nm,
-                               "market": ("KOSDAQ" if "KOSDAQ" in mkt or "코스닥" in mkt
-                                          else ("KOSPI" if mkt or typ == "ETF"
-                                                else (prev or {}).get("market", "KOSPI"))),
-                               "type": typ if typ == "ETF"
-                                       else ((prev or {}).get("type")
-                                             or guess_kr_type(nm) or "주식")}
-                    n0 += 1
-                log.append((f"유니버스 {mk}", "성공", f"{n0:,}종목"))
+                    mv = str(r[mcol]).upper() if mcol is not None else ""
+                    mkt = ("KOSDAQ" if ("KOSDAQ" in mv or "코스닥" in mv or mv == "KSQ")
+                           else ("KOSPI" if mv else ""))
+                    pv = safe(r[pcol]) if pcol is not None else None
+                    if put(c, nm, mkt, typ if typ == "ETF" else (kr_sec_type(nm, None)),
+                           f"FDR:{mk}", pv):
+                        n0 += 1
+                log.append((f"유니버스 {mk}", "성공",
+                            f'코드열 "{ccol}" · 이름열 "{ncol}" · 신규 {n0:,}종목'))
             except Exception as e:
-                log.append((f"유니버스 {mk}", "실패", f"{type(e).__name__}"))
+                log.append((f"유니버스 {mk}", "실패", f"{type(e).__name__}: {str(e)[:50]}"))
+
     if HAS_KRX:
         d0 = ymd(bday())
         for mk in ("KOSPI", "KOSDAQ"):
             lst, why = krx_try(krx.get_market_ticker_list, d0, market=mk)
             if lst:
-                added = 0
+                n0 = 0
                 for c in lst:
-                    if c not in rows:
-                        try:
-                            nm = krx.get_market_ticker_name(c)
-                        except Exception:
-                            nm = c
-                        rows[c] = {"name": nm, "market": mk, "type": "주식"}
-                        added += 1
-                    else:
+                    if c in rows:
                         rows[c]["market"] = mk
-                log.append((f"유니버스 {mk}(pykrx)", "성공", f"{len(lst):,}종목 · 신규 {added}"))
+                        continue
+                    try:
+                        nm = krx.get_market_ticker_name(c)
+                    except Exception:
+                        continue
+                    if put(c, nm, mk, kr_sec_type(nm, None), "pykrx"):
+                        n0 += 1
+                log.append((f"유니버스 {mk}(pykrx)", "성공", f"{len(lst):,}종목 · 신규 {n0:,}"))
             else:
                 log.append((f"유니버스 {mk}(pykrx)", "실패", why))
-        nlst, _wn = krx_try(krx.get_etn_ticker_list, d0)
-        if nlst:
-            for c in nlst:
-                if c in rows:
-                    rows[c]["type"] = "ETN"
-                else:
-                    try:
-                        nm = krx.get_etn_ticker_name(c)
-                    except Exception:
-                        nm = c
-                    rows[c] = {"name": nm, "market": "KOSPI", "type": "ETN"}
-            log.append(("유니버스 ETN(pykrx)", "성공", f"{len(nlst):,}종목"))
-        elst, why = krx_try(krx.get_etf_ticker_list, d0)
-        if elst:
-            for c in elst:
-                if c in rows:
-                    rows[c]["type"] = "ETF"
-                else:
-                    try:
-                        nm = krx.get_etf_ticker_name(c)
-                    except Exception:
-                        nm = c
-                    rows[c] = {"name": nm, "market": "KOSPI", "type": "ETF"}
-            log.append(("유니버스 ETF(pykrx)", "성공", f"{len(elst):,}종목"))
-        else:
-            log.append(("유니버스 ETF(pykrx)", "실패", why))
+        for fn_list, fn_name, tp in ((getattr(krx, "get_etn_ticker_list", None),
+                                      getattr(krx, "get_etn_ticker_name", None), "ETN"),
+                                     (getattr(krx, "get_etf_ticker_list", None),
+                                      getattr(krx, "get_etf_ticker_name", None), "ETF")):
+            if fn_list is None:
+                continue
+            lst, why = krx_try(fn_list, d0)
+            if lst:
+                for c in lst:
+                    if c in rows:
+                        rows[c]["type"] = tp
+                        continue
+                    nm = c
+                    if fn_name:
+                        try:
+                            nm = fn_name(c)
+                        except Exception:
+                            pass
+                    put(c, nm, "KOSPI", tp, "pykrx")
+                log.append((f"유니버스 {tp}(pykrx)", "성공", f"{len(lst):,}종목"))
+            else:
+                log.append((f"유니버스 {tp}(pykrx)", "실패", why))
+
+    # 무결성 자체 점검
+    bad = [c for c in rows if not CODE_RE.match(c)]
+    if bad:
+        for c in bad:
+            rows.pop(c, None)
+        log.append(("무결성 점검", "부분", f"형식 오류 코드 {len(bad)}건 제거"))
+    log.append(("유니버스 합계", "성공" if rows else "실패", f"{len(rows):,}종목"))
     return rows, log
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def kr_official_name(code):
+    """코드 → 종목명을 소스별로 각각 조회 (교차검증용).
+    반환 {source: name}"""
+    out = {}
+    if HAS_KRX:
+        for fn, lab in ((getattr(krx, "get_market_ticker_name", None), "pykrx(주식)"),
+                        (getattr(krx, "get_etf_ticker_name", None), "pykrx(ETF)"),
+                        (getattr(krx, "get_etn_ticker_name", None), "pykrx(ETN)")):
+            if fn is None:
+                continue
+            try:
+                nm = fn(code)
+                if nm and str(nm).strip() and str(nm).strip() != code:
+                    out[lab] = str(nm).strip()
+            except Exception:
+                continue
+    uni, _ = kr_universe()
+    if code in uni:
+        out[f'상장목록({uni[code].get("src","?")})'] = uni[code]["name"]
+    if HAS_YF:
+        for suf in (".KS", ".KQ"):
+            try:
+                i = yf.Ticker(code + suf).info or {}
+                nm = i.get("longName") or i.get("shortName")
+                if nm:
+                    out[f"yfinance{suf}"] = str(nm)
+                    break
+            except Exception:
+                continue
+    return out
+
+
+def name_consensus(code):
+    """이름 교차검증 → (대표이름, 불일치여부, 소스별dict)"""
+    src = kr_official_name(code)
+    if not src:
+        return None, False, {}
+    prio = ["pykrx(주식)", "pykrx(ETF)", "pykrx(ETN)"]
+    best = next((src[k] for k in prio if k in src), None)
+    if best is None:
+        best = next(iter(src.values()))
+
+    def norm(x):
+        return re.sub(r"[\s()]", "", str(x)).upper()
+
+    mismatch = len({norm(v) for v in src.values()}) > 1
+    return best, mismatch, src
+
+
+
+def verify_price(code, df, market):
+    """상장목록의 종가와 실제로 불러온 시세를 대조한다.
+    다른 종목의 시세를 잘못 가져왔는지 잡아내기 위한 안전장치."""
+    out = {"ok": None, "ref": None, "got": None, "gap": None, "src": None}
+    if market != "KR" or df is None or df.empty:
+        return out
+    uni, _ = kr_universe()
+    v = uni.get(code) or {}
+    ref = v.get("close")
+    if ref is None and HAS_KRX:
+        r, _w = krx_try(krx.get_market_ohlcv_by_date, ymd(bday(10)), ymd(bday()), code)
+        if r is not None and len(r):
+            col = "종가" if "종가" in r.columns else r.columns[-1]
+            ref = safe(r[col].iloc[-1])
+            out["src"] = "pykrx 일봉"
+    else:
+        out["src"] = f'상장목록({v.get("src", "?")})'
+    if ref is None or ref <= 0:
+        return out
+    got = float(df["Close"].iloc[-1])
+    gap = (got / ref - 1) * 100
+    out.update({"ref": ref, "got": got, "gap": gap, "ok": abs(gap) <= 30})
+    return out
 
 
 def kr_name_search(q, limit=15):
@@ -811,16 +966,16 @@ def load_price(ticker, force_market=None):
         if df is None:
             log.append(("일봉", "실패", "모든 소스 실패"))
             return None, "KR", t, log
-        uni, _ = kr_universe()
-        nm = (uni.get(t) or {}).get("name")
-        if not nm and HAS_KRX:
-            for f in (krx.get_market_ticker_name, krx.get_etf_ticker_name):
-                try:
-                    nm = f(t)
-                    if nm:
-                        break
-                except Exception:
-                    continue
+        nm, mismatch, nsrc = name_consensus(t)
+        if mismatch:
+            log.append(("종목명 교차검증", "부분",
+                        "소스별 이름 불일치 — " +
+                        " / ".join(f"{k}={v}" for k, v in nsrc.items())))
+        elif nm:
+            log.append(("종목명 교차검증", "성공",
+                        f"{nm} (" + ", ".join(nsrc.keys()) + ")"))
+        else:
+            log.append(("종목명 교차검증", "실패", "어느 소스에서도 종목명을 찾지 못함"))
         name = f"{nm} ({t})" if nm else t
         log.append(("일봉", "성공", f"{src} · {len(df):,}일 ({df.index[0]:%Y-%m-%d}~)"))
         return df, "KR", name, log
@@ -3411,8 +3566,14 @@ with st.sidebar:
             _c3 = re.sub(r"[^0-9A-Z]", "", pk.upper())
             ok3, src3, px3 = probe_kr(_c3)
             if ok3:
-                st.success(f'{_c3} · 조회 성공 ({src3})'
+                _n3, _mm3, _s3 = name_consensus(_c3)
+                st.success(f'{_c3} · {_n3 or "이름 미확인"} · 조회 성공 ({src3})'
                            + (f' · 최근 종가 {px3:,.0f}' if px3 else ''))
+                if _s3:
+                    st.caption("소스별 이름 · "
+                               + " / ".join(f"{k}={v}" for k, v in _s3.items()))
+                if _mm3:
+                    st.warning("소스마다 이름이 다릅니다. pykrx 결과를 기준으로 보세요.")
                 if st.button("이 종목으로 분석하기", use_container_width=True,
                              type="primary", key="probe_go"):
                     _u4, _ = kr_universe()
@@ -3510,6 +3671,17 @@ def build_context(tk, force_market=None):
         return ctx
     dfd = dfd[~dfd.index.duplicated(keep="last")].sort_index()
     idxs, ilog = load_indices(market)
+    nm_best, nm_mismatch, nm_src = (name_consensus(tk) if market == "KR"
+                                    else (None, False, {}))
+    pv_chk = verify_price(tk, dfd, market)
+    if pv_chk.get("ok") is False:
+        log.append(("시세 교차검증", "실패",
+                    f'기준 종가 {pv_chk["ref"]:,.0f} vs 불러온 종가 {pv_chk["got"]:,.0f} '
+                    f'({pv_chk["gap"]:+.1f}%) — 다른 종목의 시세일 수 있습니다'))
+    elif pv_chk.get("ok"):
+        log.append(("시세 교차검증", "성공",
+                    f'기준 {pv_chk["ref"]:,.0f} vs 실제 {pv_chk["got"]:,.0f} '
+                    f'({pv_chk["gap"]:+.1f}%)'))
     etfinfo = detect_etf(tk, market, name)
     seg0 = kr_segment(tk) if market == "KR" else None
     fnd = load_kr_fund_all(tk, seg0) if market == "KR" else load_us_fund(tk)
@@ -3536,6 +3708,8 @@ def build_context(tk, force_market=None):
                 "rating": rating, "rets": r, "rsl": rsl, "rs_new": rs_new, "uni": uni,
                 "bench": bench, "bench_nm": bench_nm,
                 "etf": etfinfo, "seg": seg0,
+                "name_src": nm_src, "name_mismatch": nm_mismatch, "name_best": nm_best,
+                "price_chk": pv_chk,
                 "price": float(dfd["Close"].iloc[-1])})
     return ctx
 
@@ -3662,6 +3836,17 @@ with TABS[0]:
     else:
         df, market, price = CTX["df"], CTX["market"], CTX["price"]
         chg = (price / float(df["Close"].iloc[-2]) - 1) * 100
+        if CTX.get("price_chk", {}).get("ok") is False:
+            _p = CTX["price_chk"]
+            st.error(f'**불러온 시세가 이 종목의 시세와 다를 수 있습니다.** '
+                     f'기준 종가 {_p["ref"]:,.0f}원 vs 불러온 종가 {_p["got"]:,.0f}원 '
+                     f'({_p["gap"]:+.1f}%). 개별종목 탭의 "종목 정보 검증"을 확인하세요.')
+        if CTX.get("name_mismatch"):
+            st.error("**종목명이 소스마다 다릅니다.** 아래 이름·시세가 입력하신 코드와 "
+                     "일치하지 않을 수 있습니다. 개별종목 탭 맨 위의 '종목 정보 검증'에서 "
+                     "소스별 결과를 확인하세요.  \n"
+                     + " / ".join(f"**{k}** → {v}"
+                                  for k, v in (CTX.get("name_src") or {}).items()))
         st.markdown(
             f'<div class="masthead"><h1>{CTX["name"]} '
             f'<span class="mono amb" style="font-size:1.05rem">{fmt(price, market)}'
@@ -3888,6 +4073,49 @@ with TABS[3]:
         df, market, price, ma = CTX["df"], CTX["market"], CTX["price"], CTX["ma"]
         binfo, fnd = CTX["binfo"], CTX["fnd"]
         sticky_bar(CTX, D)
+        with st.expander("종목 정보 검증 — 이 코드가 정말 이 종목인가",
+                         expanded=bool(CTX.get("name_mismatch"))):
+            vrows = []
+            for k, v in (CTX.get("name_src") or {}).items():
+                vrows.append([k, v,
+                              tag("일치", "pass") if not CTX.get("name_mismatch")
+                              else tag("확인 필요", "warn")])
+            if market == "KR":
+                _u5, _ = kr_universe()
+                _v5 = _u5.get(TK)
+                vrows.append(["상장목록 유형",
+                              (kr_sec_type(_v5.get("name"), _v5.get("type"))
+                               if _v5 else "목록에 없음"),
+                              tag("참고", "idle")])
+            vrows.append(["시세 시작일", f'{df.index[0]:%Y-%m-%d}',
+                          tag("참고", "idle")])
+            vrows.append(["시세 종료일 · 종가",
+                          f'{df.index[-1]:%Y-%m-%d} · {fmt(price, market)}{unit(market)}',
+                          tag("참고", "idle")])
+            vrows.append(["거래일 수", f'{len(df):,}일', tag("참고", "idle")])
+            _p2 = CTX.get("price_chk") or {}
+            if _p2.get("ref") is not None:
+                vrows.append([f'기준 종가 ({_p2.get("src") or "?"})',
+                              f'{_p2["ref"]:,.0f} vs 불러온 {_p2["got"]:,.0f} '
+                              f'({_p2["gap"]:+.1f}%)',
+                              tag("일치", "pass") if _p2.get("ok")
+                              else tag("불일치", "fail")])
+            for a, b_, c_ in CTX.get("log", []):
+                if a in ("일봉", "종목명 교차검증"):
+                    vrows.append([a, c_,
+                                  tag(b_, "pass" if b_ == "성공" else
+                                      ("warn" if b_ in ("부분", "재시도") else "fail"))])
+            st.markdown(table(["항목", "값", "판정"], vrows), unsafe_allow_html=True)
+            if CTX.get("name_mismatch"):
+                st.markdown('<div class="hint">소스마다 이름이 다르면 상장목록이 잘못 만들어졌을 '
+                            '가능성이 큽니다. pykrx 결과가 가장 신뢰할 만합니다. '
+                            '위 표를 캡처해 알려주시면 어느 소스가 틀렸는지 특정할 수 있습니다.</div>',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="hint">시세 시작일이 그 종목의 실제 상장일과 크게 다르면 '
+                            '다른 종목의 시세일 수 있습니다. 위 종가와 실제 시세도 대조해 보세요.</div>',
+                            unsafe_allow_html=True)
+
         if CTX.get("etf", {}).get("lev_inv"):
             st.error("레버리지·인버스 상품입니다. 일일 수익률을 배수로 추종하도록 설계돼 "
                      "장기 보유 시 기초지수와 괴리가 누적됩니다(변동성 끌림). "
@@ -5125,6 +5353,13 @@ KRX 단축코드는 6자리 **영숫자**입니다. 대부분은 숫자지만
 사이드바에 배지로 표시합니다. 자릿수 보정(`5930` → `005930`), `.KS` 접미사,
 `A` 접두도 인식합니다.
 
+**표시되는 종목이 맞는지 앱이 스스로 검증합니다**
+
+코드 하나에 대해 pykrx, 상장목록, yfinance가 각각 어떤 이름을 주는지 비교하고,
+서로 다르면 화면 상단에 경고를 띄웁니다. 시세도 상장목록의 종가와 대조해
+30% 넘게 벌어지면 "다른 종목의 시세일 수 있습니다"라고 알립니다.
+개별종목 탭 맨 위 **"종목 정보 검증"**에서 소스별 결과를 표로 볼 수 있습니다.
+
 **찾는 방법이 세 가지 있습니다**
 
 - **종목명 · 코드로 찾기** — `화장품`, `삼성`, `0008`처럼 이름이든 코드 조각이든 검색
@@ -5595,6 +5830,7 @@ with TABS[4]:
                     '모양이 보이게 됩니다. 오닐도 "수천 개의 차트를 직접 그려봤다"고 했습니다.</div>',
                     unsafe_allow_html=True)
     to_top()
+
 
 
 
